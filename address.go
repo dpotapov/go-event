@@ -70,10 +70,8 @@ func (a Address) Validate() error {
 	if err := ValidateToken("scope", a.Scope); err != nil {
 		return err
 	}
-	switch a.Kind {
-	case KindEvent, KindCommand, KindQuery:
-	default:
-		return fmt.Errorf("%w: kind %q", ErrInvalidName, a.Kind)
+	if err := ValidateToken("kind", string(a.Kind)); err != nil {
+		return err
 	}
 	if err := ValidateToken("aggregate type", a.AggregateType); err != nil {
 		return err

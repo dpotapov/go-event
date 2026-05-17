@@ -78,6 +78,22 @@ func TestAddressSubjectRoundTrip(t *testing.T) {
 	require.False(t, ok)
 }
 
+func TestAddressAllowsCustomMessageKind(t *testing.T) {
+	addr := Address{
+		Scope:         "billing",
+		Kind:          MessageKind("signal"),
+		AggregateType: "account",
+		AggregateID:   "acct-1",
+		Name:          "refresh",
+	}
+	require.NoError(t, addr.Validate())
+	require.Equal(t, "billing.signal.account.acct-1.refresh", addr.Subject())
+
+	parsed, ok := ParseSubject(addr.Subject())
+	require.True(t, ok)
+	require.Equal(t, addr, parsed)
+}
+
 func TestCatalogRegistersAndDecodesTypes(t *testing.T) {
 	catalog := NewCatalog()
 	require.NoError(t, RegisterEventType[*accountCreated](catalog))
