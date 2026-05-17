@@ -1,6 +1,9 @@
 # go-event
 
-`go-event` is a small Go library for message-oriented services. It defines the stable domain contracts for commands, queries, events, event-sourced aggregates, and transport-neutral subscriptions, with a NATS JetStream backend for production and embedded-server test utilities for unit and integration tests.
+`go-event` is a small Go library for message-oriented services. It defines stable
+domain contracts for commands, queries, events, event-sourced aggregates, and
+transport-neutral subscriptions, with a NATS JetStream backend for production and
+embedded-server test utilities for unit and integration tests.
 
 The library keeps the domain space intentionally small:
 
@@ -9,7 +12,8 @@ The library keeps the domain space intentionally small:
 - `Event` records a committed aggregate state change.
 - `Aggregate` rebuilds state by applying events.
 - `EventStore` appends and loads aggregate event streams with optimistic concurrency.
-- `Bus` wires dispatchers, command/query subscribers, and event subscribers together while allowing handlers to be added before or after `Start`.
+- `Bus` wires dispatchers, command/query subscribers, and event subscribers together
+  while allowing handlers to be added before or after `Start`.
 
 ## Install
 
@@ -41,7 +45,8 @@ billing.command.account.acct-123.rename
 billing.query.account.acct-123.get
 ```
 
-Concrete tokens must not contain dots, whitespace, `*`, `>`, or path separators. Stream subjects use one trailing wildcard:
+Concrete tokens must not contain dots, whitespace, `*`, `>`, or path separators.
+Stream subjects use one trailing wildcard:
 
 ```text
 <scope>.event.<aggregate-type>.>
@@ -55,7 +60,8 @@ The default stream name is:
 
 ## Event Store CAS
 
-The NATS event store uses JetStream per-subject optimistic concurrency. For an aggregate save it sets:
+The NATS event store uses JetStream per-subject optimistic concurrency. For an
+aggregate save it sets:
 
 ```text
 Nats-Expected-Last-Subject-Sequence
@@ -68,13 +74,18 @@ The expected subject is the aggregate filter:
 <scope>.event.<aggregate-type>.<aggregate-id>.>
 ```
 
-That means the returned aggregate version is the last JetStream stream sequence for that aggregate, not a simple count of aggregate events. This is deliberate: it lets different event names for the same aggregate share one CAS boundary.
+That means the returned aggregate version is the last JetStream stream sequence for
+that aggregate, not a simple count of aggregate events. This is deliberate: it lets
+different event names for the same aggregate share one CAS boundary.
 
-When saving multiple events, the NATS backend uses `Nats-Batch-Id`, `Nats-Batch-Sequence`, and `Nats-Batch-Commit` so the batch commits atomically. `EnsureEventStream` enables `AllowAtomicPublish` by default.
+When saving multiple events, the NATS backend uses `Nats-Batch-Id`,
+`Nats-Batch-Sequence`, and `Nats-Batch-Commit` so the batch commits atomically.
+`EnsureEventStream` enables `AllowAtomicPublish` by default.
 
 ## Stream Creation
 
-Use the helper for a suitable default stream, then customize any JetStream field by mutating the config:
+Use the helper for a suitable default stream, then customize any JetStream field by
+mutating the config:
 
 ```go
 stream, err := goeventnats.EnsureEventStream(ctx, js, "billing", "account",
@@ -94,7 +105,13 @@ event.MustRegisterEventType[*AccountCreated](catalog)
 event.MustRegisterCommandType[*RenameAccount](catalog)
 
 dispatcher, _ := goeventnats.NewDispatcher(nc, goeventnats.DispatcherConfig{})
-commands, _ := goeventnats.NewCommandSubscriber(nc, goeventnats.CommandSubscriberConfig{Catalog: catalog, Queue: "accounts"})
+commands, _ := goeventnats.NewCommandSubscriber(
+    nc,
+    goeventnats.CommandSubscriberConfig{
+        Catalog: catalog,
+        Queue:   "accounts",
+    },
+)
 events, _ := goeventnats.NewSubscriber(nc, goeventnats.SubscriberConfig{Catalog: catalog})
 
 bus := event.NewBus(dispatcher, commands, events, event.BusOptions{
@@ -116,15 +133,21 @@ if err := bus.Start(ctx); err != nil {
 defer bus.Stop(context.Background())
 ```
 
-Handlers can be registered after `Start`. Ordered event handlers are grouped by aggregate type behind a broad ordered subscription; queue handlers use precise durable consumers.
+Handlers can be registered after `Start`. Ordered event handlers are grouped by
+aggregate type behind a broad ordered subscription; queue handlers use precise durable
+consumers.
 
 ## Queue Consumer Strategy
 
-Queue event subscriptions create one durable consumer per concrete filter instead of forcing unrelated subjects into one broad consumer. This avoids over-delivery and keeps authorization scopes narrow. If a direct subscription requests multiple event names, the NATS adapter creates multiple consumers with stable derived names.
+Queue event subscriptions create one durable consumer per concrete filter instead of
+forcing unrelated subjects into one broad consumer. This avoids over-delivery and keeps
+authorization scopes narrow. If a direct subscription requests multiple event names,
+the NATS adapter creates multiple consumers with stable derived names.
 
 ## Testing
 
-Fast unit tests can use `testkit.NewBusHarness`, which records subscriptions and lets tests trigger commands, queries, and events directly.
+Fast unit tests can use `testkit.NewBusHarness`, which records subscriptions and lets
+tests trigger commands, queries, and events directly.
 
 Real NATS tests can use the embedded JetStream server:
 
@@ -137,10 +160,12 @@ The server listens on a random local port and is cleaned up through `t.Cleanup`.
 
 ## Benchmarks
 
-The NATS package includes benchmarks for raw JetStream consumption and the `go-event` subscription path:
+The NATS package includes benchmarks for raw JetStream consumption and the `go-event`
+subscription path:
 
 ```sh
 go test -bench=. -benchmem ./nats
 ```
 
-Benchmarks are useful for catching overhead regressions, but exact ratios depend on machine, server settings, and Go/NATS versions.
+Benchmarks are useful for catching overhead regressions, but exact ratios depend on
+machine, server settings, and Go/NATS versions.
