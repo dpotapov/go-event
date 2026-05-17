@@ -12,8 +12,7 @@ The library keeps the domain space intentionally small:
 - `Event` records a committed aggregate state change.
 - `Aggregate` rebuilds state by applying events.
 - `EventStore` appends and loads aggregate event streams with optimistic concurrency.
-- `Bus` wires dispatchers, command/query subscribers, and event subscribers together
-  while allowing handlers to be added before or after `Start`.
+- `Bus` wires dispatchers, command/query subscribers, and event subscribers together.
 
 ## Install
 
