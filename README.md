@@ -1,9 +1,9 @@
 # go-event
 
-`go-event` is a small Go library for message-oriented services. It defines stable
-domain contracts for commands, queries, events, event-sourced aggregates, and
-transport-neutral subscriptions, with a NATS JetStream backend for production and
-embedded-server test utilities for unit and integration tests.
+`go-event` is a small Go library for message-oriented services and event sourcing.
+It defines stable domain contracts for commands, queries, events, event-sourced
+aggregates, and transport-neutral subscriptions, with a NATS JetStream backend for
+production.
 
 The library keeps the domain space intentionally small:
 
