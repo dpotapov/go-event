@@ -2,6 +2,7 @@ package nats_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
 	"sync/atomic"
@@ -249,6 +250,9 @@ func BenchmarkRawJetStreamSubscription(b *testing.B) {
 	})
 	require.NoError(b, err)
 	cc, err := consumer.Consume(func(msg jetstream.Msg) {
+		_, _ = msg.Metadata()
+		var evt accountCreated
+		_ = json.Unmarshal(msg.Data(), &evt)
 		count.Add(1)
 		_ = msg.Ack()
 	})
