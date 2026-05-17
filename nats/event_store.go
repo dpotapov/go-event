@@ -73,22 +73,22 @@ func (s *EventStore) EnsureStream(ctx context.Context, scope, aggregateType stri
 	return EnsureEventStream(ctx, s.js, scope, aggregateType, options...)
 }
 
-func (s *EventStore) Save(ctx context.Context, aggregate goevent.Aggregate, expectedVersion uint64, events ...goevent.Event) error {
+func (s *EventStore) Save(ctx context.Context, agg goevent.Aggregate, expectedVersion uint64, events ...goevent.Event) error {
 	if len(events) == 0 {
 		return nil
 	}
-	if err := validateEvents(aggregate, events); err != nil {
+	if err := validateEvents(agg, events); err != nil {
 		return err
 	}
 	if len(events) == 1 {
-		return s.publishOne(ctx, aggregate, expectedVersion, events[0])
+		return s.publishOne(ctx, agg, expectedVersion, events[0])
 	}
-	return s.publishBatch(ctx, aggregate, expectedVersion, events)
+	return s.publishBatch(ctx, agg, expectedVersion, events)
 }
 
-func (s *EventStore) Load(ctx context.Context, aggregate goevent.Aggregate) (uint64, error) {
-	streamName := s.streamFor(aggregate.AggregateScope(), aggregate.AggregateType())
-	filter := AggregateEventFilter(aggregate.AggregateScope(), aggregate.AggregateType(), aggregate.AggregateID())
+func (s *EventStore) Load(ctx context.Context, agg goevent.Aggregate) (uint64, error) {
+	streamName := s.streamFor(agg.AggregateScope(), agg.AggregateType())
+	filter := AggregateEventFilter(agg.AggregateScope(), agg.AggregateType(), agg.AggregateID())
 	stream, err := s.js.Stream(ctx, streamName)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrStreamNotFound) {
@@ -129,7 +129,7 @@ func (s *EventStore) Load(ctx context.Context, aggregate goevent.Aggregate) (uin
 		if err != nil {
 			return 0, err
 		}
-		if err := aggregate.Apply(evt); err != nil {
+		if err := agg.Apply(evt); err != nil {
 			return 0, fmt.Errorf("apply event at sequence %d: %w", version, err)
 		}
 		if meta.NumPending == 0 {
@@ -138,17 +138,17 @@ func (s *EventStore) Load(ctx context.Context, aggregate goevent.Aggregate) (uin
 	}
 }
 
-func (s *EventStore) publishOne(ctx context.Context, aggregate goevent.Aggregate, expectedVersion uint64, evt goevent.Event) error {
+func (s *EventStore) publishOne(ctx context.Context, agg goevent.Aggregate, expectedVersion uint64, evt goevent.Event) error {
 	data, err := marshalEvent(evt)
 	if err != nil {
 		return err
 	}
 	subject := EventSubject(evt.AggregateScope(), evt.AggregateType(), evt.AggregateID(), evt.EventName())
-	filter := AggregateEventFilter(aggregate.AggregateScope(), aggregate.AggregateType(), aggregate.AggregateID())
+	filter := AggregateEventFilter(agg.AggregateScope(), agg.AggregateType(), agg.AggregateID())
 	msg := gonats.NewMsg(subject)
 	msg.Data = data
 	_, err = s.js.PublishMsg(ctx, msg,
-		jetstream.WithExpectStream(s.streamFor(aggregate.AggregateScope(), aggregate.AggregateType())),
+		jetstream.WithExpectStream(s.streamFor(agg.AggregateScope(), agg.AggregateType())),
 		jetstream.WithExpectLastSequenceForSubject(expectedVersion, filter),
 	)
 	if err != nil {
@@ -157,10 +157,10 @@ func (s *EventStore) publishOne(ctx context.Context, aggregate goevent.Aggregate
 	return nil
 }
 
-func (s *EventStore) publishBatch(ctx context.Context, aggregate goevent.Aggregate, expectedVersion uint64, events []goevent.Event) error {
+func (s *EventStore) publishBatch(ctx context.Context, agg goevent.Aggregate, expectedVersion uint64, events []goevent.Event) error {
 	batchID := nuid.Next()
-	filter := AggregateEventFilter(aggregate.AggregateScope(), aggregate.AggregateType(), aggregate.AggregateID())
-	stream := s.streamFor(aggregate.AggregateScope(), aggregate.AggregateType())
+	filter := AggregateEventFilter(agg.AggregateScope(), agg.AggregateType(), agg.AggregateID())
+	stream := s.streamFor(agg.AggregateScope(), agg.AggregateType())
 
 	for i, evt := range events {
 		data, err := marshalEvent(evt)
@@ -233,13 +233,13 @@ func marshalEvent(evt goevent.Event) ([]byte, error) {
 	return data, nil
 }
 
-func validateEvents(aggregate goevent.Aggregate, events []goevent.Event) error {
+func validateEvents(agg goevent.Aggregate, events []goevent.Event) error {
 	for i, evt := range events {
-		if evt.AggregateScope() != aggregate.AggregateScope() ||
-			evt.AggregateType() != aggregate.AggregateType() ||
-			evt.AggregateID() != aggregate.AggregateID() {
+		if evt.AggregateScope() != agg.AggregateScope() ||
+			evt.AggregateType() != agg.AggregateType() ||
+			evt.AggregateID() != agg.AggregateID() {
 			return fmt.Errorf("event %d does not belong to aggregate %s.%s.%s", i,
-				aggregate.AggregateScope(), aggregate.AggregateType(), aggregate.AggregateID())
+				agg.AggregateScope(), agg.AggregateType(), agg.AggregateID())
 		}
 		if err := goevent.EventAddress(evt).Validate(); err != nil {
 			return err

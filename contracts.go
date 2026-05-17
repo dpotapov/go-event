@@ -35,6 +35,6 @@ type Aggregate interface {
 
 // EventStore appends and loads aggregate event streams.
 type EventStore interface {
-	Save(ctx context.Context, aggregate Aggregate, expectedVersion uint64, events ...Event) error
-	Load(ctx context.Context, aggregate Aggregate) (version uint64, err error)
+	Save(ctx context.Context, agg Aggregate, expectedVersion uint64, events ...Event) error
+	Load(ctx context.Context, agg Aggregate) (version uint64, err error)
 }

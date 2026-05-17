@@ -123,12 +123,12 @@ type flakyStore struct {
 	saves int
 }
 
-func (s *flakyStore) Load(ctx context.Context, aggregate Aggregate) (uint64, error) {
+func (s *flakyStore) Load(ctx context.Context, agg Aggregate) (uint64, error) {
 	s.loads++
 	return uint64(s.loads - 1), nil
 }
 
-func (s *flakyStore) Save(ctx context.Context, aggregate Aggregate, expectedVersion uint64, events ...Event) error {
+func (s *flakyStore) Save(ctx context.Context, agg Aggregate, expectedVersion uint64, events ...Event) error {
 	s.saves++
 	if s.saves == 1 {
 		return ErrConflict
