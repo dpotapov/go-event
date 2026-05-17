@@ -62,7 +62,7 @@ func (a *accountAggregate) Apply(evt Event) error {
 func TestAddressSubjectRoundTrip(t *testing.T) {
 	addr := Address{
 		Scope:         "billing",
-		Class:         ClassEvent,
+		Kind:          KindEvent,
 		AggregateType: "account",
 		AggregateID:   "acct-1",
 		Name:          "created",
@@ -85,7 +85,7 @@ func TestCatalogRegistersAndDecodesTypes(t *testing.T) {
 
 	evt, err := catalog.DecodeEvent(Address{
 		Scope:         "billing",
-		Class:         ClassEvent,
+		Kind:          KindEvent,
 		AggregateType: "account",
 		Name:          "created",
 	}, []byte(`{"account_id":"acct-1","name":"Acme"}`))
@@ -94,7 +94,7 @@ func TestCatalogRegistersAndDecodesTypes(t *testing.T) {
 
 	cmd, err := catalog.DecodeCommand(Address{
 		Scope:         "billing",
-		Class:         ClassCommand,
+		Kind:          KindCommand,
 		AggregateType: "account",
 		Name:          "rename",
 	}, []byte(`{"account_id":"acct-1","name":"New"}`))

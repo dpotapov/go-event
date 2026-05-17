@@ -116,18 +116,18 @@ func NewCommandSubscriber(nc *gonats.Conn, cfg CommandSubscriberConfig) (*Comman
 }
 
 func (s *CommandSubscriber) SubscribeCommand(ctx context.Context, handler goevent.CommandHandler, cfg goevent.CommandSubscriptionConfig) (goevent.Subscription, error) {
-	return s.subscribe(ctx, goevent.ClassCommand, goevent.CommandHandlerFunc(func(ctx context.Context, cmd goevent.Command) error {
+	return s.subscribe(ctx, goevent.KindCommand, goevent.CommandHandlerFunc(func(ctx context.Context, cmd goevent.Command) error {
 		return handler.HandleCommand(ctx, cmd)
 	}), nil, cfg)
 }
 
 func (s *CommandSubscriber) SubscribeQuery(ctx context.Context, handler goevent.QueryHandler, cfg goevent.CommandSubscriptionConfig) (goevent.Subscription, error) {
-	return s.subscribe(ctx, goevent.ClassQuery, nil, handler, cfg)
+	return s.subscribe(ctx, goevent.KindQuery, nil, handler, cfg)
 }
 
 func (s *CommandSubscriber) subscribe(
 	ctx context.Context,
-	class goevent.MessageClass,
+	kind goevent.MessageKind,
 	commandHandler goevent.CommandHandler,
 	queryHandler goevent.QueryHandler,
 	cfg goevent.CommandSubscriptionConfig,
@@ -140,10 +140,10 @@ func (s *CommandSubscriber) subscribe(
 		queue = s.queue
 	}
 	group := &natsSubscriptions{}
-	for _, filter := range commandFilters(class, cfg) {
+	for _, filter := range commandFilters(kind, cfg) {
 		filter := filter
 		sub, err := s.nc.QueueSubscribe(filter, queue, func(msg *gonats.Msg) {
-			s.handle(ctx, class, msg, commandHandler, queryHandler)
+			s.handle(ctx, kind, msg, commandHandler, queryHandler)
 		})
 		if err != nil {
 			_ = group.Stop(context.Background())
@@ -154,9 +154,9 @@ func (s *CommandSubscriber) subscribe(
 	return group, nil
 }
 
-func (s *CommandSubscriber) handle(ctx context.Context, class goevent.MessageClass, msg *gonats.Msg, commandHandler goevent.CommandHandler, queryHandler goevent.QueryHandler) {
+func (s *CommandSubscriber) handle(ctx context.Context, kind goevent.MessageKind, msg *gonats.Msg, commandHandler goevent.CommandHandler, queryHandler goevent.QueryHandler) {
 	addr, ok := parseAddress(msg.Subject)
-	if !ok || addr.Class != class {
+	if !ok || addr.Kind != kind {
 		_ = respond(msg, responseEnvelope{OK: false, Error: "invalid subject"})
 		return
 	}

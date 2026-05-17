@@ -26,7 +26,7 @@ func StreamName(pattern, scope, aggregateType string) string {
 func EventSubject(scope, aggregateType, aggregateID, eventName string) string {
 	return goevent.Address{
 		Scope:         scope,
-		Class:         goevent.ClassEvent,
+		Kind:          goevent.KindEvent,
 		AggregateType: aggregateType,
 		AggregateID:   aggregateID,
 		Name:          eventName,
@@ -34,11 +34,11 @@ func EventSubject(scope, aggregateType, aggregateID, eventName string) string {
 }
 
 func AggregateEventFilter(scope, aggregateType, aggregateID string) string {
-	return strings.Join([]string{scope, string(goevent.ClassEvent), aggregateType, aggregateID, ">"}, ".")
+	return strings.Join([]string{scope, string(goevent.KindEvent), aggregateType, aggregateID, ">"}, ".")
 }
 
 func EventTypeFilter(scope, aggregateType string) string {
-	return strings.Join([]string{scope, string(goevent.ClassEvent), aggregateType, ">"}, ".")
+	return strings.Join([]string{scope, string(goevent.KindEvent), aggregateType, ">"}, ".")
 }
 
 func CommandSubject(cmd goevent.Command) string {
@@ -60,7 +60,7 @@ func eventFilters(cfg goevent.EventSubscriptionConfig) []string {
 			for _, name := range names {
 				filters = append(filters, strings.Join([]string{
 					cfg.AggregateScope,
-					string(goevent.ClassEvent),
+					string(goevent.KindEvent),
 					typ,
 					id,
 					name,
@@ -71,7 +71,7 @@ func eventFilters(cfg goevent.EventSubscriptionConfig) []string {
 	return filters
 }
 
-func commandFilters(class goevent.MessageClass, cfg goevent.CommandSubscriptionConfig) []string {
+func commandFilters(kind goevent.MessageKind, cfg goevent.CommandSubscriptionConfig) []string {
 	scope := cfg.AggregateScope
 	if scope == "" {
 		scope = "*"
@@ -86,7 +86,7 @@ func commandFilters(class goevent.MessageClass, cfg goevent.CommandSubscriptionC
 			for _, name := range names {
 				filters = append(filters, strings.Join([]string{
 					scope,
-					string(class),
+					string(kind),
 					typ,
 					id,
 					name,

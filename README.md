@@ -25,10 +25,10 @@ go get github.com/dpotapov/go-event
 The NATS backend uses one five-token subject shape:
 
 ```text
-<scope>.<class>.<aggregate-type>.<aggregate-id>.<message-name>
+<scope>.<kind>.<aggregate-type>.<aggregate-id>.<message-name>
 ```
 
-Classes are:
+Kinds are:
 
 ```text
 event

@@ -7,12 +7,12 @@ import (
 	"unicode"
 )
 
-type MessageClass string
+type MessageKind string
 
 const (
-	ClassEvent   MessageClass = "event"
-	ClassCommand MessageClass = "command"
-	ClassQuery   MessageClass = "query"
+	KindEvent   MessageKind = "event"
+	KindCommand MessageKind = "command"
+	KindQuery   MessageKind = "query"
 )
 
 var ErrInvalidName = errors.New("invalid message name")
@@ -20,7 +20,7 @@ var ErrInvalidName = errors.New("invalid message name")
 // Address is the transport-neutral location of a command, query, or event.
 type Address struct {
 	Scope         string
-	Class         MessageClass
+	Kind          MessageKind
 	AggregateType string
 	AggregateID   string
 	Name          string
@@ -29,7 +29,7 @@ type Address struct {
 func EventAddress(evt Event) Address {
 	return Address{
 		Scope:         evt.AggregateScope(),
-		Class:         ClassEvent,
+		Kind:          KindEvent,
 		AggregateType: evt.AggregateType(),
 		AggregateID:   evt.AggregateID(),
 		Name:          evt.EventName(),
@@ -39,7 +39,7 @@ func EventAddress(evt Event) Address {
 func CommandAddress(cmd Command) Address {
 	return Address{
 		Scope:         cmd.AggregateScope(),
-		Class:         ClassCommand,
+		Kind:          KindCommand,
 		AggregateType: cmd.AggregateType(),
 		AggregateID:   cmd.AggregateID(),
 		Name:          cmd.CommandName(),
@@ -49,7 +49,7 @@ func CommandAddress(cmd Command) Address {
 func QueryAddress(query Command) Address {
 	return Address{
 		Scope:         query.AggregateScope(),
-		Class:         ClassQuery,
+		Kind:          KindQuery,
 		AggregateType: query.AggregateType(),
 		AggregateID:   query.AggregateID(),
 		Name:          query.CommandName(),
@@ -59,7 +59,7 @@ func QueryAddress(query Command) Address {
 func (a Address) Subject() string {
 	return strings.Join([]string{
 		a.Scope,
-		string(a.Class),
+		string(a.Kind),
 		a.AggregateType,
 		a.AggregateID,
 		a.Name,
@@ -70,10 +70,10 @@ func (a Address) Validate() error {
 	if err := ValidateToken("scope", a.Scope); err != nil {
 		return err
 	}
-	switch a.Class {
-	case ClassEvent, ClassCommand, ClassQuery:
+	switch a.Kind {
+	case KindEvent, KindCommand, KindQuery:
 	default:
-		return fmt.Errorf("%w: class %q", ErrInvalidName, a.Class)
+		return fmt.Errorf("%w: kind %q", ErrInvalidName, a.Kind)
 	}
 	if err := ValidateToken("aggregate type", a.AggregateType); err != nil {
 		return err
@@ -94,7 +94,7 @@ func ParseSubject(subject string) (Address, bool) {
 	}
 	addr := Address{
 		Scope:         parts[0],
-		Class:         MessageClass(parts[1]),
+		Kind:          MessageKind(parts[1]),
 		AggregateType: parts[2],
 		AggregateID:   parts[3],
 		Name:          parts[4],

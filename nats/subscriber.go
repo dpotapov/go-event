@@ -309,7 +309,7 @@ func (s *consumeSession) handleMessage(msg jetstream.Msg) {
 
 func (s *consumeSession) decodeEvent(msg jetstream.Msg, meta *jetstream.MsgMetadata, logger *slog.Logger) (goevent.Event, bool) {
 	addr, ok := parseAddress(msg.Subject())
-	if !ok || addr.Class != goevent.ClassEvent {
+	if !ok || addr.Kind != goevent.KindEvent {
 		logger.WarnContext(s.ctx, "invalid event subject")
 		s.ack(msg, logger)
 		return nil, false

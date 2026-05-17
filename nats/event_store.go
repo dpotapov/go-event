@@ -195,7 +195,7 @@ func (s *EventStore) publishBatch(ctx context.Context, aggregate goevent.Aggrega
 
 func (s *EventStore) decodeEvent(subject string, data []byte, timestamp time.Time) (goevent.Event, error) {
 	addr, ok := parseAddress(subject)
-	if !ok || addr.Class != goevent.ClassEvent {
+	if !ok || addr.Kind != goevent.KindEvent {
 		return nil, fmt.Errorf("invalid event subject %q", subject)
 	}
 	evt, err := s.catalog.NewEvent(addr.Scope, addr.AggregateType, addr.Name)
