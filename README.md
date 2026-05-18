@@ -5,20 +5,187 @@ It defines stable domain contracts for commands, queries, events, event-sourced
 aggregates, and transport-neutral subscriptions, with a NATS JetStream backend for
 production.
 
-The library keeps the domain space intentionally small:
+The library keeps the domain space intentionally small, but each concept has a
+specific role:
 
-- `Command` asks a service to do something.
-- `Query[R]` asks a service to return a typed result without side effects.
-- `Event` records a committed aggregate state change.
-- `Aggregate` rebuilds state by applying events.
-- `EventStore` appends and loads aggregate event streams with optimistic concurrency.
-- `Bus` wires dispatchers, command/query subscribers, and event subscribers together.
+- `Command` is a synchronous request to make a service do something. It is expected
+  to complete quickly, usually within a request timeout configured by the message
+  bus implementation.
+- `Query[R]` is like a command, but returns a typed result. Query handlers should
+  read state and report an answer without committing domain changes.
+- `Event` records a committed aggregate state change. Events can also be published
+  as integration events so other services can react asynchronously.
+- `ESAggregate` rebuilds state by applying the event types it explicitly declares.
+- `Store` appends and loads aggregate event streams with optimistic
+  concurrency. For background on event sourcing, see Martin Fowler's
+  [Event Sourcing](https://martinfowler.com/eaaDev/EventSourcing.html) and Greg
+  Young's [Building an Event Storage](https://cqrs.wordpress.com/documents/building-event-storage/).
+- `Bus` lets services communicate by dispatching commands, invoking queries, and
+  subscribing to commands, queries, and events. Event subscriptions have two common
+  models: an event handler builds local projections from an ordered event stream,
+  while a queue event handler behaves like an asynchronous command distributed among
+  workers.
 
 ## Install
 
 ```sh
 go get github.com/dpotapov/go-event
 ```
+
+## Quick Tutorial: Order Processing Example
+
+```go
+import (
+    ...
+	event "github.com/dpotapov/go-event"
+	natsevt "github.com/dpotapov/go-event/nats"
+	"github.com/nats-io/nats.go"
+)
+```
+
+Start with small aggregate identity types. Embedding one in each message promotes
+the `AggregateRef` methods and keeps message definitions focused on payload fields.
+
+```go
+type OrderID string
+
+// Scope names the service or bounded context that owns this aggregate.
+func (OrderID) AggregateScope() string { return "sales" }
+func (OrderID) AggregateType() string  { return "order" }
+func (id OrderID) AggregateID() string { return string(id) }
+
+type WorkerID int
+
+func (WorkerID) AggregateScope() string { return "ops" }
+func (WorkerID) AggregateType() string  { return "worker" }
+func (id WorkerID) AggregateID() string { return strconv.Itoa(int(id)) }
+```
+
+Define the command, domain event, and an event-like log message:
+
+```go
+type OrderCreateCommand struct {
+	OrderID    `json:"order_id"`
+	CustomerID string `json:"customer_id"`
+}
+
+func (*OrderCreateCommand) CommandName() string { return "create" }
+
+type OrderCreatedEvent struct {
+	OrderID    `json:"order_id"`
+	CustomerID string `json:"customer_id"`
+}
+
+func (*OrderCreatedEvent) EventName() string { return "created" }
+
+type WorkerLogMessage struct {
+	WorkerID `json:"worker_id"`
+
+	Level   string    `json:"level"`
+	Message string    `json:"message"`
+	Time    time.Time `json:"time"`
+}
+
+// MessageKind is optional. Events default to "event", commands to "command",
+// and queries to "query". Logs are event-like: they happened and should be
+// recorded, not handled as calls to do something.
+func (*WorkerLogMessage) MessageKind() string { return "log" }
+func (e *WorkerLogMessage) EventName() string { return e.Level }
+```
+
+The worker subscribes to `OrderCreateCommand` and stores the resulting
+`OrderCreatedEvent` with optimistic concurrency through `event.Execute`.
+
+```go
+func startOrderWorker(ctx context.Context, nc *nats.Conn) (*event.Bus, error) {
+	es, err := natsevt.NewEventStore(nc, natsevt.EventStoreConfig{})
+	if err != nil {
+		return nil, fmt.Errorf("create event store: %w", err)
+	}
+
+	bus, err := natsevt.NewBus(nc, natsevt.BusConfig{
+		Queue: "order-workers",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create bus: %w", err)
+	}
+	event.HandleCommand(bus, orderCreateHandler(es, bus, WorkerID(1)))
+	if err := bus.Connect(ctx); err != nil {
+		return nil, fmt.Errorf("connect bus: %w", err)
+	}
+	return bus, nil
+}
+```
+
+There are two setup rules in the example above:
+
+- Register handlers before calling `Connect`. The typed helper
+  `event.HandleCommand` tells the bus both which subject to subscribe to and
+  which Go type to decode when a message arrives.
+- Teach each event-sourced aggregate how to replay its history. `event.Execute`
+  loads the current aggregate state before running the command handler, so the
+  aggregate lists the event types it can apply with `EventTypes`.
+
+Most services can start with `natsevt.NewBus`. Use `event.NewBus` only when you
+need lower-level transport configuration, such as custom JetStream consumer
+options.
+
+The command handler mutates an event-sourced aggregate. After the order is created,
+it publishes a log message directly through the bus because logs do not need
+aggregate replay or optimistic concurrency checks. The `newOrder` factory gives
+`event.Execute` a fresh aggregate when it retries after a concurrent write.
+
+```go
+type Order struct {
+	OrderID
+	Created bool
+}
+
+func (*Order) EventTypes() []event.Event {
+	return []event.Event{&OrderCreatedEvent{}}
+}
+
+func (o *Order) Apply(evt event.Event) {
+	switch e := evt.(type) {
+	case *OrderCreatedEvent:
+		o.OrderID = e.OrderID
+		o.Created = true
+	}
+}
+
+func orderCreateHandler(store event.Store, publisher event.Publisher, workerID WorkerID) func(context.Context, *OrderCreateCommand) error {
+	return func(ctx context.Context, cmd *OrderCreateCommand) error {
+		newOrder := func() *Order {
+			return &Order{OrderID: cmd.OrderID}
+		}
+
+		err := event.Execute(ctx, store,
+			newOrder,
+			func(ctx context.Context, order *Order, version, attempt uint64) ([]event.Event, error) {
+				if order.Created {
+					return nil, nil
+				}
+				return []event.Event{&OrderCreatedEvent{
+					OrderID:    cmd.OrderID,
+					CustomerID: cmd.CustomerID,
+				}}, nil
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("create order: %w", err)
+		}
+		return publisher.Publish(ctx, &WorkerLogMessage{
+			WorkerID: workerID,
+			Level:    "info",
+			Message:  "order created",
+			Time:     time.Now(),
+		})
+	}
+}
+```
+
+Use `Store.Save` for event-sourced aggregate state. Use `Bus.Publish` for simple
+messages such as logs where there is no aggregate version to check.
 
 ## NATS Subject Convention
 
@@ -79,62 +246,26 @@ different event names for the same aggregate share one CAS boundary.
 
 When saving multiple events, the NATS backend uses `Nats-Batch-Id`,
 `Nats-Batch-Sequence`, and `Nats-Batch-Commit` so the batch commits atomically.
-`EnsureEventStream` enables `AllowAtomicPublish` by default.
 
 ## Stream Creation
 
-Use the helper for a suitable default stream, then customize any JetStream field by
-mutating the config:
+The library owns the subject convention, but your application owns stream
+creation. Use `SetStreamSubjects` to put the right subject filter on any
+JetStream stream config:
 
 ```go
-stream, err := goeventnats.EnsureEventStream(ctx, js, "billing", "account",
-    goeventnats.ConfigureStream(func(cfg *jetstream.StreamConfig) {
-        cfg.Replicas = 3
-        cfg.MaxAge = 30 * 24 * time.Hour
-        cfg.Metadata["owner"] = "billing"
-    }),
-)
-```
-
-## Bus Example
-
-```go
-catalog := event.NewCatalog()
-event.MustRegisterEventType[*AccountCreated](catalog)
-event.MustRegisterCommandType[*RenameAccount](catalog)
-
-dispatcher, _ := goeventnats.NewDispatcher(nc, goeventnats.DispatcherConfig{})
-commands, _ := goeventnats.NewCommandSubscriber(
-    nc,
-    goeventnats.CommandSubscriberConfig{
-        Catalog: catalog,
-        Queue:   "accounts",
-    },
-)
-events, _ := goeventnats.NewSubscriber(nc, goeventnats.SubscriberConfig{Catalog: catalog})
-
-bus := event.NewBus(dispatcher, commands, events, event.BusOptions{
-    Catalog: catalog,
-    Queue:   "accounts",
-})
-
-_, _ = event.CommandHandlerOf(bus, func(ctx context.Context, cmd *RenameAccount) error {
-    return nil
-})
-
-_, _ = event.EventHandlerOf(bus, func(ctx context.Context, evt *AccountCreated) error {
-    return nil
-})
-
-if err := bus.Start(ctx); err != nil {
-    return err
+cfg := jetstream.StreamConfig{
+	Name:               "BILLING_ACCOUNT_EVENTS",
+	Storage:            jetstream.FileStorage,
+	AllowAtomicPublish: true,
 }
-defer bus.Stop(context.Background())
+natsevt.SetStreamSubjects(&cfg, OrderID(""))
+stream, err := js.CreateOrUpdateStream(ctx, cfg)
 ```
 
-Handlers can be registered after `Start`. Ordered event handlers are grouped by
-aggregate type behind a broad ordered subscription; queue handlers use precise durable
-consumers.
+Handlers are registered before `Connect`. Ordered event handlers are grouped by
+aggregate type behind a broad ordered subscription and catch up before command and
+queue handlers start; queue handlers use precise durable consumers.
 
 ## Queue Consumer Strategy
 
@@ -142,29 +273,3 @@ Queue event subscriptions create one durable consumer per concrete filter instea
 forcing unrelated subjects into one broad consumer. This avoids over-delivery and keeps
 authorization scopes narrow. If a direct subscription requests multiple event names,
 the NATS adapter creates multiple consumers with stable derived names.
-
-## Testing
-
-Fast unit tests can use `testkit.NewBusHarness`, which records subscriptions and lets
-tests trigger commands, queries, and events directly.
-
-Real NATS tests can use the embedded JetStream server:
-
-```go
-env := natstest.Run(t)
-env.EnsureEventStream(t, "billing", "account", goeventnats.WithMemoryStorage())
-```
-
-The server listens on a random local port and is cleaned up through `t.Cleanup`.
-
-## Benchmarks
-
-The NATS package includes benchmarks for raw JetStream consumption and the `go-event`
-subscription path:
-
-```sh
-go test -bench=. -benchmem ./nats
-```
-
-Benchmarks are useful for catching overhead regressions, but exact ratios depend on
-machine, server settings, and Go/NATS versions.
