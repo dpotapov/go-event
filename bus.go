@@ -9,11 +9,9 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 )
 
 type BusOptions struct {
-	Catalog                  *Catalog
 	Queue                    string
 	Logger                   *slog.Logger
 	CursorStore              CursorStore
@@ -25,9 +23,10 @@ type BusOptions struct {
 
 type Bus struct {
 	dispatcher Dispatcher
+	publisher  Publisher
 	commands   CommandSubscriber
 	events     EventSubscriber
-	catalog    *Catalog
+	registry   *registry
 	queue      string
 	logger     *slog.Logger
 
@@ -42,7 +41,6 @@ type Bus struct {
 	closed        bool
 	ctx           context.Context
 	cancel        context.CancelFunc
-	nextID        atomic.Uint64
 	orderedGroups map[orderedKey]*eventGroup
 	queueGroups   map[queueKey]*eventGroup
 	commandsRegs  []*commandRegistration
@@ -52,24 +50,24 @@ type Bus struct {
 	stopErr       error
 }
 
-func NewBus(dispatcher Dispatcher, commands CommandSubscriber, events EventSubscriber, opts BusOptions) *Bus {
-	catalog := opts.Catalog
-	if catalog == nil {
-		catalog = NewCatalog()
-	}
+func NewBus(dispatcher Dispatcher, publisher Publisher, commands CommandSubscriber, events EventSubscriber, opts BusOptions) *Bus {
+	registry := newRegistry()
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
+	bindRegistry(commands, registry)
+	bindRegistry(events, registry)
 	retries := opts.CommandConflictRetries
 	if retries == 0 {
 		retries = 5
 	}
 	return &Bus{
 		dispatcher:               dispatcher,
+		publisher:                publisher,
 		commands:                 commands,
 		events:                   events,
-		catalog:                  catalog,
+		registry:                 registry,
 		queue:                    opts.Queue,
 		logger:                   logger,
 		cursorStore:              opts.CursorStore,
@@ -83,7 +81,20 @@ func NewBus(dispatcher Dispatcher, commands CommandSubscriber, events EventSubsc
 	}
 }
 
-func (b *Bus) Start(ctx context.Context) error {
+// registryBinder is optional glue for transport adapters. Bus owns the decoder
+// registry populated by typed handlers; adapters that decode incoming bytes bind
+// to it so command/event subscriptions see the same registered Go types.
+type registryBinder interface {
+	BindRegistry(DecoderRegistry)
+}
+
+func bindRegistry(target any, registry DecoderRegistry) {
+	if binder, ok := target.(registryBinder); ok {
+		binder.BindRegistry(registry)
+	}
+}
+
+func (b *Bus) Connect(ctx context.Context) error {
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
@@ -107,7 +118,7 @@ func (b *Bus) Start(ctx context.Context) error {
 	caughtUp := make(chan struct{}, len(ordered))
 	for _, group := range ordered {
 		if err := b.startOrderedGroup(runCtx, group, caughtUp); err != nil {
-			_ = b.Stop(context.Background())
+			_ = b.Disconnect()
 			return err
 		}
 	}
@@ -115,32 +126,32 @@ func (b *Bus) Start(ctx context.Context) error {
 		select {
 		case <-caughtUp:
 		case <-runCtx.Done():
-			_ = b.Stop(context.Background())
+			_ = b.Disconnect()
 			return runCtx.Err()
 		}
 	}
 	for _, reg := range commands {
 		if err := b.startCommand(runCtx, reg); err != nil {
-			_ = b.Stop(context.Background())
+			_ = b.Disconnect()
 			return err
 		}
 	}
 	for _, reg := range queries {
 		if err := b.startQuery(runCtx, reg); err != nil {
-			_ = b.Stop(context.Background())
+			_ = b.Disconnect()
 			return err
 		}
 	}
 	for _, group := range queues {
 		if err := b.startQueueGroup(runCtx, group); err != nil {
-			_ = b.Stop(context.Background())
+			_ = b.Disconnect()
 			return err
 		}
 	}
 	return nil
 }
 
-func (b *Bus) Stop(ctx context.Context) error {
+func (b *Bus) Disconnect() error {
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
@@ -183,7 +194,7 @@ func (b *Bus) Stop(ctx context.Context) error {
 	}
 	var firstErr error
 	for _, sub := range subs {
-		if err := sub.Stop(ctx); err != nil && firstErr == nil {
+		if err := sub.Stop(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -195,17 +206,29 @@ func (b *Bus) Done() <-chan error {
 	return b.done
 }
 
-func (b *Bus) Catalog() *Catalog {
-	return b.catalog
+func (b *Bus) RegisterMessageType(prototype any) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.mustAllowRegistrationLocked()
+	return b.registry.RegisterMessageType(prototype)
+}
+
+func (b *Bus) mustAllowRegistrationLocked() {
+	switch {
+	case b.closed:
+		panic(ErrClosed)
+	case b.running:
+		panic("bus is connected")
+	}
 }
 
 func (b *Bus) DispatchCommand(ctx context.Context, cmd Command) error {
 	if b.dispatcher == nil {
 		return ErrNoResponders
 	}
-	addr := CommandAddress(cmd)
+	subj := CommandSubject(cmd)
 	if !b.excludeCommandDebugNames[cmd.CommandName()] {
-		b.logger.DebugContext(ctx, "dispatch command", "subject", addr.Subject())
+		b.logger.DebugContext(ctx, "dispatch command", "subject", subj)
 	}
 	return b.dispatcher.DispatchCommand(ctx, cmd)
 }
@@ -214,9 +237,16 @@ func (b *Bus) DispatchQuery(ctx context.Context, query Command, result any) erro
 	if b.dispatcher == nil {
 		return ErrNoResponders
 	}
-	addr := QueryAddress(query)
-	b.logger.DebugContext(ctx, "dispatch query", "subject", addr.Subject())
+	subj := QuerySubject(query)
+	b.logger.DebugContext(ctx, "dispatch query", "subject", subj)
 	return b.dispatcher.DispatchQuery(ctx, query, result)
+}
+
+func (b *Bus) Publish(ctx context.Context, events ...Event) error {
+	if b.publisher == nil {
+		return ErrNoResponders
+	}
+	return b.publisher.Publish(ctx, events...)
 }
 
 type HandlerOption func(*handlerOptions)
@@ -231,14 +261,18 @@ func WithAggregateIDs(ids ...string) HandlerOption {
 	}
 }
 
-func EventHandlerOf[T Event](b *Bus, handler func(context.Context, T) error, opts ...HandlerOption) (Subscription, error) {
+// HandleEvent registers an ordered event handler for T. It must be called before
+// Connect; it panics if the bus is already connected or closed, or if T cannot
+// be registered as a message type.
+func HandleEvent[T Event](b *Bus, handler func(context.Context, T) error, opts ...HandlerOption) {
 	prototype, err := newTypedValue[T]()
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
-	if err := b.catalog.RegisterEvent(prototype); err != nil {
-		return nil, err
+	if err := b.RegisterMessageType(prototype); err != nil {
+		panic(err)
 	}
+	kind := messageKind(prototype, KindEvent)
 	options := collectHandlerOptions(opts)
 	wrapped := EventHandlerFunc(func(ctx context.Context, evt Event, cursor []byte) error {
 		typed, ok := evt.(T)
@@ -247,17 +281,21 @@ func EventHandlerOf[T Event](b *Bus, handler func(context.Context, T) error, opt
 		}
 		return handler(ctx, typed)
 	})
-	return b.addOrderedHandler(prototype.AggregateScope(), prototype.AggregateType(), prototype.EventName(), options.aggregateIDs, wrapped)
+	b.addOrderedHandler(kind, prototype.AggregateScope(), prototype.AggregateType(), prototype.EventName(), options.aggregateIDs, wrapped)
 }
 
-func QueueEventHandlerOf[T Event](b *Bus, handler func(context.Context, T) error, opts ...HandlerOption) (Subscription, error) {
+// HandleQueueEvent registers a queue event handler for T. It must be called
+// before Connect; it panics if the bus is already connected or closed, if T
+// cannot be registered as a message type, or if the bus has no queue configured.
+func HandleQueueEvent[T Event](b *Bus, handler func(context.Context, T) error, opts ...HandlerOption) {
 	prototype, err := newTypedValue[T]()
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
-	if err := b.catalog.RegisterEvent(prototype); err != nil {
-		return nil, err
+	if err := b.RegisterMessageType(prototype); err != nil {
+		panic(err)
 	}
+	kind := messageKind(prototype, KindEvent)
 	options := collectHandlerOptions(opts)
 	wrapped := EventHandlerFunc(func(ctx context.Context, evt Event, cursor []byte) error {
 		typed, ok := evt.(T)
@@ -266,17 +304,21 @@ func QueueEventHandlerOf[T Event](b *Bus, handler func(context.Context, T) error
 		}
 		return handler(ctx, typed)
 	})
-	return b.addQueueHandler(prototype.AggregateScope(), prototype.AggregateType(), prototype.EventName(), options.aggregateIDs, wrapped)
+	b.addQueueHandler(kind, prototype.AggregateScope(), prototype.AggregateType(), prototype.EventName(), options.aggregateIDs, wrapped)
 }
 
-func CommandHandlerOf[T Command](b *Bus, handler func(context.Context, T) error, opts ...HandlerOption) (Subscription, error) {
+// HandleCommand registers a command handler for T. It must be called before
+// Connect; it panics if the bus is already connected or closed, or if T cannot
+// be registered as a message type.
+func HandleCommand[T Command](b *Bus, handler func(context.Context, T) error, opts ...HandlerOption) {
 	prototype, err := newTypedValue[T]()
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
-	if err := b.catalog.RegisterCommand(prototype); err != nil {
-		return nil, err
+	if err := b.RegisterMessageType(prototype); err != nil {
+		panic(err)
 	}
+	kind := messageKind(prototype, KindCommand)
 	options := collectHandlerOptions(opts)
 	wrapped := CommandHandlerFunc(func(ctx context.Context, cmd Command) error {
 		typed, ok := cmd.(T)
@@ -285,16 +327,23 @@ func CommandHandlerOf[T Command](b *Bus, handler func(context.Context, T) error,
 		}
 		return handler(ctx, typed)
 	})
-	return b.addCommandHandler(prototype.AggregateScope(), prototype.AggregateType(), prototype.CommandName(), options.aggregateIDs, wrapped)
+	b.addCommandHandler(kind, prototype.AggregateScope(), prototype.AggregateType(), prototype.CommandName(), options.aggregateIDs, wrapped)
 }
 
-func QueryHandlerOf[T Command, R any](b *Bus, handler func(context.Context, T) (R, error)) (Subscription, error) {
+// HandleQuery registers a query handler for T. It must be called before
+// Connect; it panics if the bus is already connected or closed, or if T cannot
+// be registered as a message type.
+func HandleQuery[T Command, R any](b *Bus, handler func(context.Context, T) (R, error)) {
 	prototype, err := newTypedValue[T]()
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
-	if err := b.catalog.RegisterCommand(prototype); err != nil {
-		return nil, err
+	kind := messageKind(prototype, KindQuery)
+	b.mu.Lock()
+	b.mustAllowRegistrationLocked()
+	b.mu.Unlock()
+	if err := b.registry.registerCommand(prototype, kind); err != nil {
+		panic(err)
 	}
 	wrapped := QueryHandlerFunc(func(ctx context.Context, query Command) (any, error) {
 		typed, ok := query.(T)
@@ -303,16 +352,18 @@ func QueryHandlerOf[T Command, R any](b *Bus, handler func(context.Context, T) (
 		}
 		return handler(ctx, typed)
 	})
-	return b.addQueryHandler(prototype.AggregateScope(), prototype.AggregateType(), prototype.CommandName(), wrapped)
+	b.addQueryHandler(kind, prototype.AggregateScope(), prototype.AggregateType(), prototype.CommandName(), wrapped)
 }
 
 type orderedKey struct {
 	scope string
+	kind  MessageKind
 	agg   string
 }
 
 type queueKey struct {
 	scope string
+	kind  MessageKind
 	agg   string
 	id    string
 	name  string
@@ -322,6 +373,7 @@ type queueKey struct {
 type eventGroup struct {
 	ordered  bool
 	scope    string
+	kind     MessageKind
 	agg      string
 	id       string
 	name     string
@@ -331,95 +383,54 @@ type eventGroup struct {
 }
 
 type registeredEventHandler struct {
-	id           uint64
 	eventName    string
 	aggregateIDs []string
 	handler      EventHandler
 }
 
-type eventRegistration struct {
-	b       *Bus
-	id      uint64
-	ordered bool
-	okey    orderedKey
-	qkey    queueKey
-}
-
-func (r *eventRegistration) Stop(ctx context.Context) error {
-	return r.b.removeEventHandler(ctx, r)
-}
-
-func (b *Bus) addOrderedHandler(scope, agg, name string, ids []string, handler EventHandler) (Subscription, error) {
-	id := b.nextID.Add(1)
-	key := orderedKey{scope: scope, agg: agg}
+func (b *Bus) addOrderedHandler(kind MessageKind, scope, agg, name string, ids []string, handler EventHandler) {
+	key := orderedKey{scope: scope, kind: kind, agg: agg}
 	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.mustAllowRegistrationLocked()
 	group := b.orderedGroups[key]
 	if group == nil {
-		group = &eventGroup{ordered: true, scope: scope, agg: agg, handlers: make(map[uint64]registeredEventHandler)}
+		group = &eventGroup{ordered: true, scope: scope, kind: kind, agg: agg, handlers: make(map[uint64]registeredEventHandler)}
 		b.orderedGroups[key] = group
 	}
-	group.handlers[id] = registeredEventHandler{id: id, eventName: name, aggregateIDs: ids, handler: handler}
-	shouldStart := b.running && group.sub == nil
-	ctx := b.ctx
-	b.mu.Unlock()
-	if shouldStart {
-		caughtUp := make(chan struct{}, 1)
-		if err := b.startOrderedGroup(ctx, group, caughtUp); err != nil {
-			_ = b.removeEventHandler(context.Background(), &eventRegistration{b: b, id: id, ordered: true, okey: key})
-			return nil, err
-		}
-	}
-	return &eventRegistration{b: b, id: id, ordered: true, okey: key}, nil
+	group.handlers[uint64(len(group.handlers)+1)] = registeredEventHandler{eventName: name, aggregateIDs: ids, handler: handler}
 }
 
-func (b *Bus) addQueueHandler(scope, agg, name string, ids []string, handler EventHandler) (Subscription, error) {
+func (b *Bus) addQueueHandler(kind MessageKind, scope, agg, name string, ids []string, handler EventHandler) {
 	if b.queue == "" {
-		return nil, fmt.Errorf("queue event handler requires BusOptions.Queue")
+		panic("queue event handler requires BusOptions.Queue")
 	}
 	if len(ids) == 0 {
 		ids = []string{""}
 	}
-	var regs []Subscription
 	for _, idFilter := range ids {
-		reg, err := b.addOneQueueHandler(scope, agg, idFilter, name, handler)
-		if err != nil {
-			for _, r := range regs {
-				_ = r.Stop(context.Background())
-			}
-			return nil, err
-		}
-		regs = append(regs, reg)
+		b.addOneQueueHandler(kind, scope, agg, idFilter, name, handler)
 	}
-	return multiRegistration(regs), nil
 }
 
-func (b *Bus) addOneQueueHandler(scope, agg, idFilter, name string, handler EventHandler) (Subscription, error) {
-	id := b.nextID.Add(1)
-	key := queueKey{scope: scope, agg: agg, id: idFilter, name: name, queue: b.queue}
+func (b *Bus) addOneQueueHandler(kind MessageKind, scope, agg, idFilter, name string, handler EventHandler) {
+	key := queueKey{scope: scope, kind: kind, agg: agg, id: idFilter, name: name, queue: b.queue}
 	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.mustAllowRegistrationLocked()
 	group := b.queueGroups[key]
 	if group == nil {
-		group = &eventGroup{scope: scope, agg: agg, id: idFilter, name: name, queue: b.queue, handlers: make(map[uint64]registeredEventHandler)}
+		group = &eventGroup{scope: scope, kind: kind, agg: agg, id: idFilter, name: name, queue: b.queue, handlers: make(map[uint64]registeredEventHandler)}
 		b.queueGroups[key] = group
 	}
-	group.handlers[id] = registeredEventHandler{id: id, eventName: name, handler: handler}
-	shouldStart := b.running && group.sub == nil
-	ctx := b.ctx
-	b.mu.Unlock()
-	if shouldStart {
-		if err := b.startQueueGroup(ctx, group); err != nil {
-			_ = b.removeEventHandler(context.Background(), &eventRegistration{b: b, id: id, qkey: key})
-			return nil, err
-		}
-	}
-	return &eventRegistration{b: b, id: id, qkey: key}, nil
+	group.handlers[uint64(len(group.handlers)+1)] = registeredEventHandler{eventName: name, handler: handler}
 }
 
 func (b *Bus) startOrderedGroup(ctx context.Context, group *eventGroup, caughtUp chan<- struct{}) error {
 	if b.events == nil {
 		return ErrNoResponders
 	}
-	stream := group.scope + "." + group.agg
+	stream := group.scope + "." + string(group.kind) + "." + group.agg
 	var cursor []byte
 	if b.cursorStore != nil {
 		var err error
@@ -442,6 +453,7 @@ func (b *Bus) startOrderedGroup(ctx context.Context, group *eventGroup, caughtUp
 	}
 	sub, err := b.events.SubscribeEvents(ctx, handler, EventSubscriptionConfig{
 		AggregateScope:   group.scope,
+		Kind:             group.kind,
 		AggregateTypes:   []string{group.agg},
 		Cursor:           cursor,
 		CursorBootPolicy: b.cursorBootPolicy,
@@ -458,7 +470,7 @@ func (b *Bus) startOrderedGroup(ctx context.Context, group *eventGroup, caughtUp
 	b.mu.Lock()
 	if !b.running || len(group.handlers) == 0 || group.sub != nil {
 		b.mu.Unlock()
-		return sub.Stop(context.Background())
+		return sub.Stop()
 	}
 	group.sub = sub
 	b.mu.Unlock()
@@ -473,14 +485,14 @@ func (b *Bus) startQueueGroup(ctx context.Context, group *eventGroup) error {
 	if group.id != "" {
 		ids = []string{group.id}
 	}
-	consumerName := strings.Join([]string{group.queue, group.scope, group.agg, wildcardName(group.id), group.name}, "_")
+	consumerName := strings.Join([]string{group.queue, group.scope, string(group.kind), group.agg, wildcardName(group.id), group.name}, "_")
 	sub, err := b.events.SubscribeEvents(ctx, EventHandlerFunc(func(ctx context.Context, evt Event, cursor []byte) error {
 		return b.dispatchEventGroup(ctx, group, evt, cursor)
 	}), EventSubscriptionConfig{
 		AggregateScope: group.scope,
+		Kind:           group.kind,
 		AggregateTypes: []string{group.agg},
 		AggregateIDs:   ids,
-		EventNames:     []string{group.name},
 		Queue:          group.queue,
 		ConsumerName:   consumerName,
 		OnError:        b.makeOnError(true),
@@ -491,7 +503,7 @@ func (b *Bus) startQueueGroup(ctx context.Context, group *eventGroup) error {
 	b.mu.Lock()
 	if !b.running || len(group.handlers) == 0 || group.sub != nil {
 		b.mu.Unlock()
-		return sub.Stop(context.Background())
+		return sub.Stop()
 	}
 	group.sub = sub
 	b.mu.Unlock()
@@ -520,35 +532,6 @@ func (b *Bus) dispatchEventGroup(ctx context.Context, group *eventGroup, evt Eve
 	return firstErr
 }
 
-func (b *Bus) removeEventHandler(ctx context.Context, reg *eventRegistration) error {
-	var sub Subscription
-	b.mu.Lock()
-	if reg.ordered {
-		group := b.orderedGroups[reg.okey]
-		if group != nil {
-			delete(group.handlers, reg.id)
-			if len(group.handlers) == 0 {
-				sub = group.sub
-				delete(b.orderedGroups, reg.okey)
-			}
-		}
-	} else {
-		group := b.queueGroups[reg.qkey]
-		if group != nil {
-			delete(group.handlers, reg.id)
-			if len(group.handlers) == 0 {
-				sub = group.sub
-				delete(b.queueGroups, reg.qkey)
-			}
-		}
-	}
-	b.mu.Unlock()
-	if sub != nil {
-		return sub.Stop(ctx)
-	}
-	return nil
-}
-
 type commandRegistration struct {
 	cfg     CommandSubscriptionConfig
 	handler CommandHandler
@@ -561,10 +544,11 @@ type queryRegistration struct {
 	sub     Subscription
 }
 
-func (b *Bus) addCommandHandler(scope, agg, name string, ids []string, handler CommandHandler) (Subscription, error) {
+func (b *Bus) addCommandHandler(kind MessageKind, scope, agg, name string, ids []string, handler CommandHandler) {
 	reg := &commandRegistration{
 		cfg: CommandSubscriptionConfig{
 			AggregateScope: scope,
+			Kind:           kind,
 			AggregateTypes: []string{agg},
 			AggregateIDs:   ids,
 			CommandNames:   []string{name},
@@ -573,32 +557,16 @@ func (b *Bus) addCommandHandler(scope, agg, name string, ids []string, handler C
 		handler: b.withCommandConflictRetry(b.withCommandLogging(handler)),
 	}
 	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.mustAllowRegistrationLocked()
 	b.commandsRegs = append(b.commandsRegs, reg)
-	shouldStart := b.running
-	ctx := b.ctx
-	b.mu.Unlock()
-	if shouldStart {
-		if err := b.startCommand(ctx, reg); err != nil {
-			return nil, err
-		}
-	}
-	return SubscriptionFunc(func(ctx context.Context) error {
-		b.mu.Lock()
-		if reg.sub == nil {
-			b.mu.Unlock()
-			return nil
-		}
-		sub := reg.sub
-		reg.sub = nil
-		b.mu.Unlock()
-		return sub.Stop(ctx)
-	}), nil
 }
 
-func (b *Bus) addQueryHandler(scope, agg, name string, handler QueryHandler) (Subscription, error) {
+func (b *Bus) addQueryHandler(kind MessageKind, scope, agg, name string, handler QueryHandler) {
 	reg := &queryRegistration{
 		cfg: CommandSubscriptionConfig{
 			AggregateScope: scope,
+			Kind:           kind,
 			AggregateTypes: []string{agg},
 			CommandNames:   []string{name},
 			Queue:          b.queue,
@@ -606,26 +574,9 @@ func (b *Bus) addQueryHandler(scope, agg, name string, handler QueryHandler) (Su
 		handler: b.withQueryLogging(handler),
 	}
 	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.mustAllowRegistrationLocked()
 	b.queryRegs = append(b.queryRegs, reg)
-	shouldStart := b.running
-	ctx := b.ctx
-	b.mu.Unlock()
-	if shouldStart {
-		if err := b.startQuery(ctx, reg); err != nil {
-			return nil, err
-		}
-	}
-	return SubscriptionFunc(func(ctx context.Context) error {
-		b.mu.Lock()
-		if reg.sub == nil {
-			b.mu.Unlock()
-			return nil
-		}
-		sub := reg.sub
-		reg.sub = nil
-		b.mu.Unlock()
-		return sub.Stop(ctx)
-	}), nil
 }
 
 func (b *Bus) startCommand(ctx context.Context, reg *commandRegistration) error {
@@ -659,11 +610,11 @@ func (b *Bus) startQuery(ctx context.Context, reg *queryRegistration) error {
 func (b *Bus) withCommandLogging(next CommandHandler) CommandHandler {
 	return CommandHandlerFunc(func(ctx context.Context, cmd Command) error {
 		if !b.excludeCommandDebugNames[cmd.CommandName()] {
-			b.logger.DebugContext(ctx, "handle command", "subject", CommandAddress(cmd).Subject())
+			b.logger.DebugContext(ctx, "handle command", "subject", CommandSubject(cmd))
 		}
 		err := next.HandleCommand(ctx, cmd)
 		if err != nil {
-			b.logger.ErrorContext(ctx, "command failed", "subject", CommandAddress(cmd).Subject(), "err", err)
+			b.logger.ErrorContext(ctx, "command failed", "subject", CommandSubject(cmd), "err", err)
 		}
 		return err
 	})
@@ -671,10 +622,10 @@ func (b *Bus) withCommandLogging(next CommandHandler) CommandHandler {
 
 func (b *Bus) withQueryLogging(next QueryHandler) QueryHandler {
 	return QueryHandlerFunc(func(ctx context.Context, query Command) (any, error) {
-		b.logger.DebugContext(ctx, "handle query", "subject", QueryAddress(query).Subject())
+		b.logger.DebugContext(ctx, "handle query", "subject", QuerySubject(query))
 		result, err := next.HandleQuery(ctx, query)
 		if err != nil {
-			b.logger.ErrorContext(ctx, "query failed", "subject", QueryAddress(query).Subject(), "err", err)
+			b.logger.ErrorContext(ctx, "query failed", "subject", QuerySubject(query), "err", err)
 		}
 		return result, err
 	})
@@ -713,7 +664,7 @@ func (b *Bus) makeOnError(isQueue bool) func(*SubscriptionError) bool {
 		b.mu.Lock()
 		b.stopErr = err
 		b.mu.Unlock()
-		go func() { _ = b.Stop(context.Background()) }()
+		go func() { _ = b.Disconnect() }()
 		return false
 	}
 }
@@ -746,18 +697,6 @@ func values[K comparable, V any](m map[K]V) []V {
 		out = append(out, v)
 	}
 	return out
-}
-
-type multiRegistration []Subscription
-
-func (m multiRegistration) Stop(ctx context.Context) error {
-	var firstErr error
-	for _, sub := range m {
-		if err := sub.Stop(ctx); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
 }
 
 func wildcardName(v string) string {

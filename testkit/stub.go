@@ -33,6 +33,19 @@ func (s *StubDispatcher) DispatchQuery(ctx context.Context, query goevent.Comman
 	return nil
 }
 
+type StubPublisher struct {
+	Events []goevent.Event
+	Err    error
+}
+
+func (s *StubPublisher) Publish(ctx context.Context, events ...goevent.Event) error {
+	if s.Err != nil {
+		return s.Err
+	}
+	s.Events = append(s.Events, events...)
+	return nil
+}
+
 type EventSubscription struct {
 	Handler goevent.EventHandler
 	Config  goevent.EventSubscriptionConfig
@@ -51,7 +64,7 @@ func (s *StubEventSubscriber) SubscribeEvents(ctx context.Context, handler goeve
 	if cfg.Queue == "" && cfg.CaughtUp != nil {
 		cfg.CaughtUp()
 	}
-	return goevent.SubscriptionFunc(func(context.Context) error { return nil }), nil
+	return goevent.SubscriptionFunc(func() error { return nil }), nil
 }
 
 type CommandSubscription struct {
@@ -75,7 +88,7 @@ func (s *StubCommandSubscriber) SubscribeCommand(ctx context.Context, handler go
 		return nil, s.Err
 	}
 	s.CommandSubscriptions = append(s.CommandSubscriptions, CommandSubscription{Handler: handler, Config: cfg})
-	return goevent.SubscriptionFunc(func(context.Context) error { return nil }), nil
+	return goevent.SubscriptionFunc(func() error { return nil }), nil
 }
 
 func (s *StubCommandSubscriber) SubscribeQuery(ctx context.Context, handler goevent.QueryHandler, cfg goevent.CommandSubscriptionConfig) (goevent.Subscription, error) {
@@ -83,25 +96,28 @@ func (s *StubCommandSubscriber) SubscribeQuery(ctx context.Context, handler goev
 		return nil, s.Err
 	}
 	s.QuerySubscriptions = append(s.QuerySubscriptions, QuerySubscription{Handler: handler, Config: cfg})
-	return goevent.SubscriptionFunc(func(context.Context) error { return nil }), nil
+	return goevent.SubscriptionFunc(func() error { return nil }), nil
 }
 
 type BusHarness struct {
 	Bus        *goevent.Bus
 	Dispatcher *StubDispatcher
+	Publisher  *StubPublisher
 	Commands   *StubCommandSubscriber
 	Events     *StubEventSubscriber
 }
 
 func NewBusHarness(queue string, opts goevent.BusOptions) *BusHarness {
 	dispatcher := &StubDispatcher{}
+	publisher := &StubPublisher{}
 	commands := &StubCommandSubscriber{}
 	events := &StubEventSubscriber{}
 	opts.Queue = queue
-	bus := goevent.NewBus(dispatcher, commands, events, opts)
+	bus := goevent.NewBus(dispatcher, publisher, commands, events, opts)
 	return &BusHarness{
 		Bus:        bus,
 		Dispatcher: dispatcher,
+		Publisher:  publisher,
 		Commands:   commands,
 		Events:     events,
 	}
@@ -113,7 +129,7 @@ func (h *BusHarness) TriggerEvent(ctx context.Context, evt goevent.Event, cursor
 			return sub.Handler.HandleEvent(ctx, evt, cursor)
 		}
 	}
-	return fmt.Errorf("no event subscription for %s", goevent.EventAddress(evt).Subject())
+	return fmt.Errorf("no event subscription for %s", goevent.EventSubject(evt))
 }
 
 func (h *BusHarness) TriggerCommand(ctx context.Context, cmd goevent.Command) error {
@@ -122,7 +138,7 @@ func (h *BusHarness) TriggerCommand(ctx context.Context, cmd goevent.Command) er
 			return sub.Handler.HandleCommand(ctx, cmd)
 		}
 	}
-	return fmt.Errorf("no command subscription for %s", goevent.CommandAddress(cmd).Subject())
+	return fmt.Errorf("no command subscription for %s", goevent.CommandSubject(cmd))
 }
 
 func (h *BusHarness) TriggerQuery(ctx context.Context, query goevent.Command) (any, error) {
@@ -131,11 +147,18 @@ func (h *BusHarness) TriggerQuery(ctx context.Context, query goevent.Command) (a
 			return sub.Handler.HandleQuery(ctx, query)
 		}
 	}
-	return nil, fmt.Errorf("no query subscription for %s", goevent.QueryAddress(query).Subject())
+	return nil, fmt.Errorf("no query subscription for %s", goevent.QuerySubject(query))
 }
 
 func eventConfigMatches(cfg goevent.EventSubscriptionConfig, evt goevent.Event) bool {
 	if cfg.AggregateScope != "" && cfg.AggregateScope != evt.AggregateScope() {
+		return false
+	}
+	kind := cfg.Kind
+	if kind == "" {
+		kind = goevent.KindEvent
+	}
+	if kind != goevent.EventSubject(evt).Kind {
 		return false
 	}
 	if len(cfg.AggregateTypes) > 0 && !contains(cfg.AggregateTypes, evt.AggregateType()) {
@@ -152,6 +175,13 @@ func eventConfigMatches(cfg goevent.EventSubscriptionConfig, evt goevent.Event) 
 
 func commandConfigMatches(cfg goevent.CommandSubscriptionConfig, cmd goevent.Command) bool {
 	if cfg.AggregateScope != "" && cfg.AggregateScope != cmd.AggregateScope() {
+		return false
+	}
+	kind := cfg.Kind
+	if kind == "" {
+		kind = goevent.KindCommand
+	}
+	if kind != goevent.CommandSubject(cmd).Kind && kind != goevent.QuerySubject(cmd).Kind {
 		return false
 	}
 	if len(cfg.AggregateTypes) > 0 && !contains(cfg.AggregateTypes, cmd.AggregateType()) {

@@ -16,7 +16,6 @@ import (
 )
 
 type SubscriberConfig struct {
-	Catalog       *goevent.Catalog
 	StreamPattern string
 	Logger        *slog.Logger
 
@@ -27,7 +26,7 @@ type SubscriberConfig struct {
 
 type Subscriber struct {
 	js            jetstream.JetStream
-	catalog       *goevent.Catalog
+	registry      goevent.DecoderRegistry
 	streamPattern string
 	logger        *slog.Logger
 
@@ -46,10 +45,6 @@ func NewSubscriber(nc *gonats.Conn, cfg SubscriberConfig) (*Subscriber, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create jetstream context: %w", err)
 	}
-	catalog := cfg.Catalog
-	if catalog == nil {
-		catalog = goevent.NewCatalog()
-	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -64,13 +59,25 @@ func NewSubscriber(nc *gonats.Conn, cfg SubscriberConfig) (*Subscriber, error) {
 	}
 	return &Subscriber{
 		js:                    js,
-		catalog:               catalog,
+		registry:              goevent.NewTypeRegistry(),
 		streamPattern:         pattern,
 		logger:                logger,
 		consumerConfig:        cfg.ConsumerConfig,
 		orderedConsumerConfig: cfg.OrderedConsumerConfig,
 		heartbeatInterval:     heartbeat,
 	}, nil
+}
+
+func (s *Subscriber) BindRegistry(registry goevent.DecoderRegistry) {
+	s.registry = registry
+}
+
+func (s *Subscriber) RegisterMessageType(prototype any) error {
+	evt, ok := prototype.(goevent.Event)
+	if !ok {
+		return fmt.Errorf("subscriber message type %T must implement event.Event", prototype)
+	}
+	return s.registry.RegisterMessageType(evt)
 }
 
 func (s *Subscriber) SubscribeEvents(ctx context.Context, handler goevent.EventHandler, cfg goevent.EventSubscriptionConfig) (goevent.Subscription, error) {
@@ -153,12 +160,12 @@ func (s *Subscriber) subscribeQueue(ctx context.Context, handler goevent.EventHa
 		}
 		consumer, err := s.js.CreateOrUpdateConsumer(ctx, stream, consumerCfg)
 		if err != nil {
-			_ = group.Stop(context.Background())
+			_ = group.Stop()
 			return nil, fmt.Errorf("create queue consumer %s: %w", name, err)
 		}
 		sub, err := s.consume(ctx, consumer, handler, cfg)
 		if err != nil {
-			_ = group.Stop(context.Background())
+			_ = group.Stop()
 			return nil, err
 		}
 		group.subs = append(group.subs, sub)
@@ -208,10 +215,10 @@ type subscriptionGroup struct {
 	subs []goevent.Subscription
 }
 
-func (g *subscriptionGroup) Stop(ctx context.Context) error {
+func (g *subscriptionGroup) Stop() error {
 	var firstErr error
 	for _, sub := range g.subs {
-		if err := sub.Stop(ctx); err != nil && firstErr == nil {
+		if err := sub.Stop(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -249,7 +256,7 @@ func (s *consumeSession) stop() {
 	}
 }
 
-func (s *consumeSession) Stop(ctx context.Context) error {
+func (s *consumeSession) Stop() error {
 	s.stop()
 	s.mu.Lock()
 	cc := s.cc
@@ -257,12 +264,8 @@ func (s *consumeSession) Stop(ctx context.Context) error {
 	if cc == nil {
 		return nil
 	}
-	select {
-	case <-cc.Closed():
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	<-cc.Closed()
+	return nil
 }
 
 func (s *consumeSession) handleMessage(msg jetstream.Msg) {
@@ -308,17 +311,25 @@ func (s *consumeSession) handleMessage(msg jetstream.Msg) {
 }
 
 func (s *consumeSession) decodeEvent(msg jetstream.Msg, meta *jetstream.MsgMetadata, logger *slog.Logger) (goevent.Event, bool) {
-	addr, ok := parseAddress(msg.Subject())
-	if !ok || addr.Kind != goevent.KindEvent {
+	subj, ok := ParseSubject(msg.Subject())
+	if !ok {
 		logger.WarnContext(s.ctx, "invalid event subject")
 		s.ack(msg, logger)
 		return nil, false
 	}
-	if len(s.cfg.EventNames) > 0 && !slices.Contains(s.cfg.EventNames, addr.Name) {
+	kind := s.cfg.Kind
+	if kind == "" {
+		kind = goevent.KindEvent
+	}
+	if subj.Kind != kind {
 		s.ack(msg, logger)
 		return nil, false
 	}
-	evt, err := s.sub.catalog.NewEvent(addr.Scope, addr.AggregateType, addr.Name)
+	if len(s.cfg.EventNames) > 0 && !slices.Contains(s.cfg.EventNames, subj.Name) {
+		s.ack(msg, logger)
+		return nil, false
+	}
+	evt, err := s.sub.registry.NewEvent(subj.Kind, subj.Scope, subj.AggregateType, subj.Name)
 	if err != nil {
 		if errors.As(err, new(*goevent.UnknownEventError)) {
 			logger.WarnContext(s.ctx, "unknown event type", "err", err)
@@ -401,7 +412,7 @@ func (s *consumeSession) onError(msg jetstream.Msg, logger *slog.Logger, err err
 		Err:              err,
 	}
 	if evt != nil {
-		info.Address = goevent.EventAddress(evt)
+		info.Subject = goevent.EventSubject(evt)
 	}
 	if !s.cfg.OnError(info) {
 		s.stop()

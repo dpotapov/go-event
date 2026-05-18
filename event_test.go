@@ -3,6 +3,8 @@ package event
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -17,6 +19,17 @@ func (e *accountCreated) AggregateScope() string { return "billing" }
 func (e *accountCreated) AggregateType() string  { return "account" }
 func (e *accountCreated) AggregateID() string    { return e.AccountID }
 func (e *accountCreated) EventName() string      { return "created" }
+
+type logEmitted struct {
+	WorkerID string `json:"worker_id"`
+	Level    string `json:"level"`
+}
+
+func (e *logEmitted) AggregateScope() string { return "ops" }
+func (e *logEmitted) MessageKind() string    { return "log" }
+func (e *logEmitted) AggregateType() string  { return "worker" }
+func (e *logEmitted) AggregateID() string    { return e.WorkerID }
+func (e *logEmitted) EventName() string      { return e.Level }
 
 type renameAccount struct {
 	AccountID string `json:"account_id"`
@@ -38,6 +51,16 @@ func (q *getAccount) AggregateID() string    { return q.AccountID }
 func (q *getAccount) CommandName() string    { return "get" }
 func (q *getAccount) ResultType() accountDTO { return accountDTO{} }
 
+type pingWorker struct {
+	WorkerID string `json:"worker_id"`
+}
+
+func (c *pingWorker) AggregateScope() string { return "ops" }
+func (c *pingWorker) MessageKind() string    { return "signal" }
+func (c *pingWorker) AggregateType() string  { return "worker" }
+func (c *pingWorker) AggregateID() string    { return c.WorkerID }
+func (c *pingWorker) CommandName() string    { return "ping" }
+
 type accountDTO struct {
 	ID string `json:"id"`
 }
@@ -50,56 +73,91 @@ type accountAggregate struct {
 func (a *accountAggregate) AggregateScope() string { return "billing" }
 func (a *accountAggregate) AggregateType() string  { return "account" }
 func (a *accountAggregate) AggregateID() string    { return a.ID }
-func (a *accountAggregate) Apply(evt Event) error {
+func (a *accountAggregate) EventTypes() []Event {
+	return []Event{&accountCreated{}}
+}
+func (a *accountAggregate) Apply(evt Event) {
 	switch e := evt.(type) {
 	case *accountCreated:
 		a.ID = e.AccountID
 		a.Name = e.Name
 	}
-	return nil
 }
 
-func TestAddressSubjectRoundTrip(t *testing.T) {
-	addr := Address{
+func TestSubjectValidate(t *testing.T) {
+	subj := Subject{
 		Scope:         "billing",
 		Kind:          KindEvent,
 		AggregateType: "account",
 		AggregateID:   "acct-1",
 		Name:          "created",
 	}
-	require.NoError(t, addr.Validate())
-	require.Equal(t, "billing.event.account.acct-1.created", addr.Subject())
+	require.NoError(t, subj.Validate())
+	require.Equal(t, "billing.event.account.acct-1.created", subj.String())
 
-	got, ok := ParseSubject(addr.Subject())
-	require.True(t, ok)
-	require.Equal(t, addr, got)
-
-	_, ok = ParseSubject("billing.event.account.bad.id.created")
-	require.False(t, ok)
+	subj.AggregateID = "bad.id"
+	require.Error(t, subj.Validate())
 }
 
-func TestAddressAllowsCustomMessageKind(t *testing.T) {
-	addr := Address{
+func TestSubjectAllowsCustomMessageKind(t *testing.T) {
+	subj := Subject{
 		Scope:         "billing",
 		Kind:          MessageKind("signal"),
 		AggregateType: "account",
 		AggregateID:   "acct-1",
 		Name:          "refresh",
 	}
-	require.NoError(t, addr.Validate())
-	require.Equal(t, "billing.signal.account.acct-1.refresh", addr.Subject())
-
-	parsed, ok := ParseSubject(addr.Subject())
-	require.True(t, ok)
-	require.Equal(t, addr, parsed)
+	require.NoError(t, subj.Validate())
 }
 
-func TestCatalogRegistersAndDecodesTypes(t *testing.T) {
-	catalog := NewCatalog()
-	require.NoError(t, RegisterEventType[*accountCreated](catalog))
-	require.NoError(t, RegisterCommandType[*renameAccount](catalog))
+func TestSubjectUsesMessageKindOverride(t *testing.T) {
+	evt := &logEmitted{WorkerID: "worker-1", Level: "info"}
+	require.Equal(t, Subject{
+		Scope:         "ops",
+		Kind:          MessageKind("log"),
+		AggregateType: "worker",
+		AggregateID:   "worker-1",
+		Name:          "info",
+	}, EventSubject(evt))
 
-	evt, err := catalog.DecodeEvent(Address{
+	cmd := &pingWorker{WorkerID: "worker-1"}
+	require.Equal(t, Subject{
+		Scope:         "ops",
+		Kind:          MessageKind("signal"),
+		AggregateType: "worker",
+		AggregateID:   "worker-1",
+		Name:          "ping",
+	}, CommandSubject(cmd))
+	require.Equal(t, Subject{
+		Scope:         "ops",
+		Kind:          MessageKind("signal"),
+		AggregateType: "worker",
+		AggregateID:   "worker-1",
+		Name:          "ping",
+	}, QuerySubject(cmd))
+}
+
+func TestSubjectLogsAsString(t *testing.T) {
+	var out strings.Builder
+	logger := slog.New(slog.NewTextHandler(&out, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	logger.DebugContext(t.Context(), "dispatch command", "subject", Subject{
+		Scope:         "billing",
+		Kind:          KindCommand,
+		AggregateType: "account",
+		AggregateID:   "acct-1",
+		Name:          "rename",
+	})
+
+	require.Contains(t, out.String(), "subject=billing.command.account.acct-1.rename")
+}
+
+func TestRegistryRegistersAndDecodesTypes(t *testing.T) {
+	registry := newRegistry()
+	require.NoError(t, RegisterMessageType[*accountCreated](registry))
+	require.NoError(t, RegisterMessageType[*renameAccount](registry))
+	require.NoError(t, RegisterMessageType[*getAccount](registry))
+
+	evt, err := registry.DecodeEvent(Subject{
 		Scope:         "billing",
 		Kind:          KindEvent,
 		AggregateType: "account",
@@ -108,7 +166,7 @@ func TestCatalogRegistersAndDecodesTypes(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "acct-1", evt.AggregateID())
 
-	cmd, err := catalog.DecodeCommand(Address{
+	cmd, err := registry.DecodeCommand(Subject{
 		Scope:         "billing",
 		Kind:          KindCommand,
 		AggregateType: "account",
@@ -116,6 +174,44 @@ func TestCatalogRegistersAndDecodesTypes(t *testing.T) {
 	}, []byte(`{"account_id":"acct-1","name":"New"}`))
 	require.NoError(t, err)
 	require.Equal(t, "acct-1", cmd.AggregateID())
+
+	query, err := registry.DecodeCommand(Subject{
+		Scope:         "billing",
+		Kind:          KindQuery,
+		AggregateType: "account",
+		Name:          "get",
+	}, []byte(`{"account_id":"acct-1"}`))
+	require.NoError(t, err)
+	require.Equal(t, "acct-1", query.AggregateID())
+}
+
+func TestRegistryDecodesCustomEventKind(t *testing.T) {
+	registry := newRegistry()
+	require.NoError(t, RegisterMessageType[*logEmitted](registry))
+
+	evt, err := registry.DecodeEvent(Subject{
+		Scope:         "ops",
+		Kind:          MessageKind("log"),
+		AggregateType: "worker",
+		Name:          "info",
+	}, []byte(`{"worker_id":"worker-1","level":"info"}`))
+	require.NoError(t, err)
+	require.Equal(t, "worker-1", evt.AggregateID())
+
+	_, err = registry.DecodeEvent(Subject{
+		Scope:         "ops",
+		Kind:          KindEvent,
+		AggregateType: "worker",
+		Name:          "info",
+	}, []byte(`{"worker_id":"worker-1","level":"info"}`))
+	require.Error(t, err)
+}
+
+func TestRegistryRejectsUnsupportedMessageType(t *testing.T) {
+	registry := newRegistry()
+
+	err := RegisterMessageType[*accountDTO](registry)
+	require.ErrorContains(t, err, "must implement event.Event or event.Command")
 }
 
 type flakyStore struct {
@@ -123,12 +219,12 @@ type flakyStore struct {
 	saves int
 }
 
-func (s *flakyStore) Load(ctx context.Context, agg Aggregate) (uint64, error) {
+func (s *flakyStore) Load(ctx context.Context, agg ESAggregate) (uint64, error) {
 	s.loads++
 	return uint64(s.loads - 1), nil
 }
 
-func (s *flakyStore) Save(ctx context.Context, agg Aggregate, expectedVersion uint64, events ...Event) error {
+func (s *flakyStore) Save(ctx context.Context, agg AggregateRef, expectedVersion uint64, events ...Event) error {
 	s.saves++
 	if s.saves == 1 {
 		return ErrConflict
@@ -173,18 +269,39 @@ func (d *recordingDispatcher) DispatchQuery(ctx context.Context, query Command, 
 	return nil
 }
 
+type recordingPublisher struct {
+	events []Event
+	err    error
+}
+
+func (p *recordingPublisher) Publish(ctx context.Context, events ...Event) error {
+	if p.err != nil {
+		return p.err
+	}
+	p.events = append(p.events, events...)
+	return nil
+}
+
 type recordingEventSubscriber struct {
-	subs []EventSubscriptionConfig
-	h    []EventHandler
+	subs  []EventSubscriptionConfig
+	h     []EventHandler
+	order *[]string
 }
 
 func (s *recordingEventSubscriber) SubscribeEvents(ctx context.Context, handler EventHandler, cfg EventSubscriptionConfig) (Subscription, error) {
+	if s.order != nil {
+		if cfg.Queue == "" {
+			*s.order = append(*s.order, "ordered")
+		} else {
+			*s.order = append(*s.order, "queue")
+		}
+	}
 	s.subs = append(s.subs, cfg)
 	s.h = append(s.h, handler)
 	if cfg.CaughtUp != nil {
 		cfg.CaughtUp()
 	}
-	return SubscriptionFunc(func(context.Context) error { return nil }), nil
+	return SubscriptionFunc(func() error { return nil }), nil
 }
 
 type recordingCommandSubscriber struct {
@@ -192,64 +309,75 @@ type recordingCommandSubscriber struct {
 	querySubs   []CommandSubscriptionConfig
 	commandH    []CommandHandler
 	queryH      []QueryHandler
+	order       *[]string
 }
 
 func (s *recordingCommandSubscriber) SubscribeCommand(ctx context.Context, handler CommandHandler, cfg CommandSubscriptionConfig) (Subscription, error) {
+	if s.order != nil {
+		*s.order = append(*s.order, "command")
+	}
 	s.commandSubs = append(s.commandSubs, cfg)
 	s.commandH = append(s.commandH, handler)
-	return SubscriptionFunc(func(context.Context) error { return nil }), nil
+	return SubscriptionFunc(func() error { return nil }), nil
 }
 
 func (s *recordingCommandSubscriber) SubscribeQuery(ctx context.Context, handler QueryHandler, cfg CommandSubscriptionConfig) (Subscription, error) {
+	if s.order != nil {
+		*s.order = append(*s.order, "query")
+	}
 	s.querySubs = append(s.querySubs, cfg)
 	s.queryH = append(s.queryH, handler)
-	return SubscriptionFunc(func(context.Context) error { return nil }), nil
+	return SubscriptionFunc(func() error { return nil }), nil
 }
 
-func TestBusSupportsDynamicHandlerRegistration(t *testing.T) {
+func TestBusRejectsHandlerRegistrationAfterConnect(t *testing.T) {
 	dispatcher := &recordingDispatcher{}
+	publisher := &recordingPublisher{}
 	commands := &recordingCommandSubscriber{}
 	events := &recordingEventSubscriber{}
-	bus := NewBus(dispatcher, commands, events, BusOptions{Queue: "svc"})
+	bus := NewBus(dispatcher, publisher, commands, events, BusOptions{Queue: "svc"})
 
-	require.NoError(t, bus.Start(t.Context()))
-	t.Cleanup(func() { require.NoError(t, bus.Stop(context.Background())) })
+	require.NoError(t, bus.Connect(t.Context()))
+	t.Cleanup(func() { require.NoError(t, bus.Disconnect()) })
 
-	received := make(chan string, 1)
-	reg, err := EventHandlerOf(bus, func(ctx context.Context, evt *accountCreated) error {
-		received <- evt.AccountID
-		return nil
+	require.Panics(t, func() {
+		HandleEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+			return nil
+		})
 	})
-	require.NoError(t, err)
-	require.NotNil(t, reg)
-	require.Len(t, events.subs, 1)
-	require.Equal(t, []string{"account"}, events.subs[0].AggregateTypes)
+}
 
-	err = events.h[0].HandleEvent(t.Context(), &accountCreated{AccountID: "acct-1"}, []byte("cursor"))
-	require.NoError(t, err)
-	require.Equal(t, "acct-1", <-received)
+func TestBusRejectsHandlerRegistrationAfterDisconnect(t *testing.T) {
+	bus := NewBus(nil, nil, nil, nil, BusOptions{})
+
+	require.NoError(t, bus.Disconnect())
+
+	require.Panics(t, func() {
+		HandleCommand(bus, func(ctx context.Context, cmd *renameAccount) error {
+			return nil
+		})
+	})
 }
 
 func TestBusDispatchAndTypedHandlers(t *testing.T) {
 	dispatcher := &recordingDispatcher{}
+	publisher := &recordingPublisher{}
 	commands := &recordingCommandSubscriber{}
 	events := &recordingEventSubscriber{}
-	bus := NewBus(dispatcher, commands, events, BusOptions{Queue: "svc"})
+	bus := NewBus(dispatcher, publisher, commands, events, BusOptions{Queue: "svc"})
 
 	commandCalled := false
-	_, err := CommandHandlerOf(bus, func(ctx context.Context, cmd *renameAccount) error {
+	HandleCommand(bus, func(ctx context.Context, cmd *renameAccount) error {
 		commandCalled = true
 		require.Equal(t, "acct-1", cmd.AccountID)
 		return nil
 	})
-	require.NoError(t, err)
-	_, err = QueryHandlerOf(bus, func(ctx context.Context, query *getAccount) (accountDTO, error) {
+	HandleQuery(bus, func(ctx context.Context, query *getAccount) (accountDTO, error) {
 		return accountDTO{ID: query.AccountID}, nil
 	})
-	require.NoError(t, err)
 
-	require.NoError(t, bus.Start(t.Context()))
-	t.Cleanup(func() { require.NoError(t, bus.Stop(context.Background())) })
+	require.NoError(t, bus.Connect(t.Context()))
+	t.Cleanup(func() { require.NoError(t, bus.Disconnect()) })
 
 	require.NoError(t, commands.commandH[0].HandleCommand(t.Context(), &renameAccount{AccountID: "acct-1"}))
 	require.True(t, commandCalled)
@@ -264,20 +392,97 @@ func TestBusDispatchAndTypedHandlers(t *testing.T) {
 	dto, err := Ask[accountDTO](t.Context(), bus, &getAccount{AccountID: "acct-4"})
 	require.NoError(t, err)
 	require.Equal(t, "acct-4", dto.ID)
+
+	require.NoError(t, bus.Publish(t.Context(), &accountCreated{AccountID: "acct-5", Name: "Acme"}))
+	require.Len(t, publisher.events, 1)
+	require.Equal(t, "acct-5", publisher.events[0].AggregateID())
+}
+
+func TestBusPublishReturnsNoRespondersWithoutPublisher(t *testing.T) {
+	bus := NewBus(nil, nil, nil, nil, BusOptions{})
+	err := bus.Publish(t.Context(), &accountCreated{AccountID: "acct-1", Name: "Acme"})
+	require.ErrorIs(t, err, ErrNoResponders)
+}
+
+func TestTypedHandlersRegisterDecodeTypesInBusRegistry(t *testing.T) {
+	bus := NewBus(nil, nil, &recordingCommandSubscriber{}, &recordingEventSubscriber{}, BusOptions{Queue: "svc"})
+
+	HandleCommand(bus, func(ctx context.Context, cmd *renameAccount) error {
+		return nil
+	})
+	HandleEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+		return nil
+	})
+
+	cmd, err := bus.registry.NewCommand(KindCommand, "billing", "account", "rename")
+	require.NoError(t, err)
+	require.IsType(t, &renameAccount{}, cmd)
+
+	evt, err := bus.registry.NewEvent(KindEvent, "billing", "account", "created")
+	require.NoError(t, err)
+	require.IsType(t, &accountCreated{}, evt)
+}
+
+func TestBusTypedHandlersUseCustomMessageKind(t *testing.T) {
+	commands := &recordingCommandSubscriber{}
+	events := &recordingEventSubscriber{}
+	bus := NewBus(nil, nil, commands, events, BusOptions{Queue: "svc"})
+
+	HandleQueueEvent(bus, func(ctx context.Context, evt *logEmitted) error {
+		return nil
+	})
+	HandleCommand(bus, func(ctx context.Context, cmd *pingWorker) error {
+		return nil
+	})
+	HandleQuery(bus, func(ctx context.Context, query *pingWorker) (accountDTO, error) {
+		return accountDTO{ID: query.WorkerID}, nil
+	})
+
+	require.NoError(t, bus.Connect(t.Context()))
+	t.Cleanup(func() { require.NoError(t, bus.Disconnect()) })
+
+	require.Equal(t, MessageKind("log"), events.subs[0].Kind)
+	require.Empty(t, events.subs[0].EventNames)
+	require.Equal(t, MessageKind("signal"), commands.commandSubs[0].Kind)
+	require.Equal(t, MessageKind("signal"), commands.querySubs[0].Kind)
+}
+
+func TestBusConnectStartsOrderedHandlersBeforeCommandsAndQueues(t *testing.T) {
+	var order []string
+	commands := &recordingCommandSubscriber{order: &order}
+	events := &recordingEventSubscriber{order: &order}
+	bus := NewBus(nil, nil, commands, events, BusOptions{Queue: "svc"})
+
+	HandleEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+		return nil
+	})
+	HandleCommand(bus, func(ctx context.Context, cmd *renameAccount) error {
+		return nil
+	})
+	HandleQuery(bus, func(ctx context.Context, query *getAccount) (accountDTO, error) {
+		return accountDTO{ID: query.AccountID}, nil
+	})
+	HandleQueueEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+		return nil
+	})
+
+	require.NoError(t, bus.Connect(t.Context()))
+	t.Cleanup(func() { require.NoError(t, bus.Disconnect()) })
+
+	require.Equal(t, []string{"ordered", "command", "query", "queue"}, order)
 }
 
 func TestBusStopsOnSubscriptionErrorWhenConfigured(t *testing.T) {
 	events := &recordingEventSubscriber{}
-	bus := NewBus(nil, nil, events, BusOptions{
+	bus := NewBus(nil, nil, nil, events, BusOptions{
 		OnSubscriptionError: func(err *SubscriptionError) bool { return false },
 	})
-	_, err := EventHandlerOf(bus, func(ctx context.Context, evt *accountCreated) error {
+	HandleEvent(bus, func(ctx context.Context, evt *accountCreated) error {
 		return errors.New("boom")
 	})
-	require.NoError(t, err)
-	require.NoError(t, bus.Start(t.Context()))
+	require.NoError(t, bus.Connect(t.Context()))
 
 	require.False(t, events.subs[0].OnError(&SubscriptionError{Err: errors.New("boom")}))
-	err = <-bus.Done()
+	err := <-bus.Done()
 	require.ErrorContains(t, err, "boom")
 }

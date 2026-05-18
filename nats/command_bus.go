@@ -82,16 +82,15 @@ func (d *Dispatcher) request(ctx context.Context, subject string, data []byte, r
 }
 
 type CommandSubscriberConfig struct {
-	Catalog *goevent.Catalog
-	Queue   string
-	Logger  *slog.Logger
+	Queue  string
+	Logger *slog.Logger
 }
 
 type CommandSubscriber struct {
-	nc      *gonats.Conn
-	catalog *goevent.Catalog
-	queue   string
-	logger  *slog.Logger
+	nc       *gonats.Conn
+	registry goevent.DecoderRegistry
+	queue    string
+	logger   *slog.Logger
 }
 
 var _ goevent.CommandSubscriber = (*CommandSubscriber)(nil)
@@ -99,10 +98,6 @@ var _ goevent.CommandSubscriber = (*CommandSubscriber)(nil)
 func NewCommandSubscriber(nc *gonats.Conn, cfg CommandSubscriberConfig) (*CommandSubscriber, error) {
 	if nc == nil {
 		return nil, fmt.Errorf("nats connection is required")
-	}
-	catalog := cfg.Catalog
-	if catalog == nil {
-		catalog = goevent.NewCatalog()
 	}
 	queue := cfg.Queue
 	if queue == "" {
@@ -112,17 +107,37 @@ func NewCommandSubscriber(nc *gonats.Conn, cfg CommandSubscriberConfig) (*Comman
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &CommandSubscriber{nc: nc, catalog: catalog, queue: queue, logger: logger}, nil
+	return &CommandSubscriber{nc: nc, registry: goevent.NewTypeRegistry(), queue: queue, logger: logger}, nil
+}
+
+func (s *CommandSubscriber) BindRegistry(registry goevent.DecoderRegistry) {
+	s.registry = registry
+}
+
+func (s *CommandSubscriber) RegisterMessageType(prototype any) error {
+	cmd, ok := prototype.(goevent.Command)
+	if !ok {
+		return fmt.Errorf("command subscriber message type %T must implement event.Command", prototype)
+	}
+	return s.registry.RegisterMessageType(cmd)
 }
 
 func (s *CommandSubscriber) SubscribeCommand(ctx context.Context, handler goevent.CommandHandler, cfg goevent.CommandSubscriptionConfig) (goevent.Subscription, error) {
-	return s.subscribe(ctx, goevent.KindCommand, goevent.CommandHandlerFunc(func(ctx context.Context, cmd goevent.Command) error {
+	kind := cfg.Kind
+	if kind == "" {
+		kind = goevent.KindCommand
+	}
+	return s.subscribe(ctx, kind, goevent.CommandHandlerFunc(func(ctx context.Context, cmd goevent.Command) error {
 		return handler.HandleCommand(ctx, cmd)
 	}), nil, cfg)
 }
 
 func (s *CommandSubscriber) SubscribeQuery(ctx context.Context, handler goevent.QueryHandler, cfg goevent.CommandSubscriptionConfig) (goevent.Subscription, error) {
-	return s.subscribe(ctx, goevent.KindQuery, nil, handler, cfg)
+	kind := cfg.Kind
+	if kind == "" {
+		kind = goevent.KindQuery
+	}
+	return s.subscribe(ctx, kind, nil, handler, cfg)
 }
 
 func (s *CommandSubscriber) subscribe(
@@ -146,7 +161,7 @@ func (s *CommandSubscriber) subscribe(
 			s.handle(ctx, kind, msg, commandHandler, queryHandler)
 		})
 		if err != nil {
-			_ = group.Stop(context.Background())
+			_ = group.Stop()
 			return nil, fmt.Errorf("subscribe %s: %w", filter, err)
 		}
 		group.subs = append(group.subs, sub)
@@ -155,12 +170,12 @@ func (s *CommandSubscriber) subscribe(
 }
 
 func (s *CommandSubscriber) handle(ctx context.Context, kind goevent.MessageKind, msg *gonats.Msg, commandHandler goevent.CommandHandler, queryHandler goevent.QueryHandler) {
-	addr, ok := parseAddress(msg.Subject)
-	if !ok || addr.Kind != kind {
+	subj, ok := ParseSubject(msg.Subject)
+	if !ok || subj.Kind != kind {
 		_ = respond(msg, responseEnvelope{OK: false, Error: "invalid subject"})
 		return
 	}
-	cmd, err := s.catalog.DecodeCommand(addr, msg.Data)
+	cmd, err := s.registry.DecodeCommand(subj, msg.Data)
 	if err != nil {
 		s.logger.ErrorContext(ctx, "decode command failed", "subject", msg.Subject, "err", err)
 		_ = respond(msg, responseEnvelope{OK: false, Error: err.Error()})
@@ -209,7 +224,7 @@ type natsSubscriptions struct {
 	subs []*gonats.Subscription
 }
 
-func (s *natsSubscriptions) Stop(ctx context.Context) error {
+func (s *natsSubscriptions) Stop() error {
 	var firstErr error
 	done := make(chan struct{})
 	go func() {
@@ -220,10 +235,6 @@ func (s *natsSubscriptions) Stop(ctx context.Context) error {
 			}
 		}
 	}()
-	select {
-	case <-done:
-		return firstErr
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	<-done
+	return firstErr
 }

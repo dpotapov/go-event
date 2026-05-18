@@ -23,33 +23,27 @@ func StreamName(pattern, scope, aggregateType string) string {
 	return replacer.Replace(pattern)
 }
 
-func EventSubject(scope, aggregateType, aggregateID, eventName string) string {
-	return goevent.Address{
-		Scope:         scope,
-		Kind:          goevent.KindEvent,
-		AggregateType: aggregateType,
-		AggregateID:   aggregateID,
-		Name:          eventName,
-	}.Subject()
+func AggregateMessageFilter(scope, aggregateType, aggregateID string) string {
+	return strings.Join([]string{scope, "*", aggregateType, aggregateID, ">"}, ".")
 }
 
-func AggregateEventFilter(scope, aggregateType, aggregateID string) string {
-	return strings.Join([]string{scope, string(goevent.KindEvent), aggregateType, aggregateID, ">"}, ".")
-}
-
-func EventTypeFilter(scope, aggregateType string) string {
-	return strings.Join([]string{scope, string(goevent.KindEvent), aggregateType, ">"}, ".")
+func EventTypeFilter(kind goevent.MessageKind, scope, aggregateType string) string {
+	return strings.Join([]string{scope, string(kind), aggregateType, ">"}, ".")
 }
 
 func CommandSubject(cmd goevent.Command) string {
-	return goevent.CommandAddress(cmd).Subject()
+	return goevent.CommandSubject(cmd).String()
 }
 
 func QuerySubject(query goevent.Command) string {
-	return goevent.QueryAddress(query).Subject()
+	return goevent.QuerySubject(query).String()
 }
 
 func eventFilters(cfg goevent.EventSubscriptionConfig) []string {
+	kind := cfg.Kind
+	if kind == "" {
+		kind = goevent.KindEvent
+	}
 	types := wildcardIfEmpty(cfg.AggregateTypes)
 	ids := wildcardIfEmpty(cfg.AggregateIDs)
 	names := wildcardIfEmpty(cfg.EventNames)
@@ -60,7 +54,7 @@ func eventFilters(cfg goevent.EventSubscriptionConfig) []string {
 			for _, name := range names {
 				filters = append(filters, strings.Join([]string{
 					cfg.AggregateScope,
-					string(goevent.KindEvent),
+					string(kind),
 					typ,
 					id,
 					name,
@@ -72,6 +66,9 @@ func eventFilters(cfg goevent.EventSubscriptionConfig) []string {
 }
 
 func commandFilters(kind goevent.MessageKind, cfg goevent.CommandSubscriptionConfig) []string {
+	if cfg.Kind != "" {
+		kind = cfg.Kind
+	}
 	scope := cfg.AggregateScope
 	if scope == "" {
 		scope = "*"
@@ -104,8 +101,19 @@ func wildcardIfEmpty(values []string) []string {
 	return values
 }
 
-func parseAddress(subject string) (goevent.Address, bool) {
-	return goevent.ParseSubject(subject)
+func ParseSubject(subject string) (goevent.Subject, bool) {
+	parts := strings.Split(subject, ".")
+	if len(parts) != 5 {
+		return goevent.Subject{}, false
+	}
+	subj := goevent.Subject{
+		Scope:         parts[0],
+		Kind:          goevent.MessageKind(parts[1]),
+		AggregateType: parts[2],
+		AggregateID:   parts[3],
+		Name:          parts[4],
+	}
+	return subj, subj.Validate() == nil
 }
 
 func consumerName(base, filter string) string {

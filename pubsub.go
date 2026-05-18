@@ -6,16 +6,17 @@ import (
 )
 
 type Subscription interface {
-	Stop(context.Context) error
+	Stop() error
 }
 
-type SubscriptionFunc func(context.Context) error
+type SubscriptionFunc func() error
 
-func (f SubscriptionFunc) Stop(ctx context.Context) error {
-	if f == nil {
-		return nil
-	}
-	return f(ctx)
+func (f SubscriptionFunc) Stop() error {
+	return f()
+}
+
+type Publisher interface {
+	Publish(context.Context, ...Event) error
 }
 
 type EventSubscriber interface {
@@ -76,6 +77,7 @@ type CursorStore interface {
 
 type EventSubscriptionConfig struct {
 	AggregateScope string
+	Kind           MessageKind
 	AggregateTypes []string
 	AggregateIDs   []string
 	EventNames     []string
@@ -93,6 +95,11 @@ type EventSubscriptionConfig struct {
 func (c EventSubscriptionConfig) Validate() error {
 	if len(c.AggregateTypes) > 0 && c.AggregateScope == "" {
 		return fmt.Errorf("invalid event subscription: aggregate scope is required when aggregate types are set")
+	}
+	if c.Kind != "" {
+		if err := ValidateToken("kind", string(c.Kind)); err != nil {
+			return err
+		}
 	}
 	for i, v := range c.AggregateTypes {
 		if err := ValidateToken(fmt.Sprintf("aggregate type[%d]", i), v); err != nil {
@@ -125,6 +132,7 @@ func (c EventSubscriptionConfig) Validate() error {
 
 type CommandSubscriptionConfig struct {
 	AggregateScope string
+	Kind           MessageKind
 	AggregateTypes []string
 	AggregateIDs   []string
 	CommandNames   []string
@@ -134,6 +142,11 @@ type CommandSubscriptionConfig struct {
 func (c CommandSubscriptionConfig) Validate() error {
 	if len(c.AggregateTypes) > 0 && c.AggregateScope == "" {
 		return fmt.Errorf("invalid command subscription: aggregate scope is required when aggregate types are set")
+	}
+	if c.Kind != "" {
+		if err := ValidateToken("kind", string(c.Kind)); err != nil {
+			return err
+		}
 	}
 	for i, v := range c.AggregateTypes {
 		if err := ValidateToken(fmt.Sprintf("aggregate type[%d]", i), v); err != nil {

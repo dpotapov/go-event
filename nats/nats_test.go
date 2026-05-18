@@ -24,14 +24,16 @@ type account struct {
 func (a *account) AggregateScope() string { return "test" }
 func (a *account) AggregateType() string  { return "account" }
 func (a *account) AggregateID() string    { return a.ID }
-func (a *account) Apply(evt goevent.Event) error {
+func (a *account) EventTypes() []goevent.Event {
+	return []goevent.Event{&accountCreated{}, &accountRenamed{}}
+}
+func (a *account) Apply(evt goevent.Event) {
 	switch e := evt.(type) {
 	case *accountCreated:
 		a.Name = e.Name
 	case *accountRenamed:
 		a.Name = e.Name
 	}
-	return nil
 }
 
 type accountCreated struct {
@@ -53,6 +55,35 @@ func (e *accountRenamed) AggregateScope() string { return "test" }
 func (e *accountRenamed) AggregateType() string  { return "account" }
 func (e *accountRenamed) AggregateID() string    { return e.AccountID }
 func (e *accountRenamed) EventName() string      { return "renamed" }
+
+type logEmitted struct {
+	WorkerID string `json:"worker_id"`
+	Level    string `json:"level"`
+	Message  string `json:"message"`
+}
+
+func (e *logEmitted) AggregateScope() string { return "test" }
+func (e *logEmitted) MessageKind() string    { return "log" }
+func (e *logEmitted) AggregateType() string  { return "worker" }
+func (e *logEmitted) AggregateID() string    { return e.WorkerID }
+func (e *logEmitted) EventName() string      { return e.Level }
+
+type workerLog struct {
+	ID      string
+	Message string
+}
+
+func (w *workerLog) AggregateScope() string { return "test" }
+func (w *workerLog) AggregateType() string  { return "worker" }
+func (w *workerLog) AggregateID() string    { return w.ID }
+func (w *workerLog) EventTypes() []goevent.Event {
+	return []goevent.Event{&logEmitted{}}
+}
+func (w *workerLog) Apply(evt goevent.Event) {
+	if e, ok := evt.(*logEmitted); ok {
+		w.Message = e.Message
+	}
+}
 
 type renameAccount struct {
 	AccountID string `json:"account_id"`
@@ -80,22 +111,43 @@ type accountView struct {
 	ID string `json:"id"`
 }
 
-func testCatalog(t testing.TB) *goevent.Catalog {
+type accountWithoutEventTypes struct {
+	account
+}
+
+func (a *accountWithoutEventTypes) EventTypes() []goevent.Event {
+	return nil
+}
+
+func registerAccountEvents(t testing.TB, registry goevent.TypeRegistry) {
 	t.Helper()
-	catalog := goevent.NewCatalog()
-	require.NoError(t, goevent.RegisterEventType[*accountCreated](catalog))
-	require.NoError(t, goevent.RegisterEventType[*accountRenamed](catalog))
-	require.NoError(t, goevent.RegisterCommandType[*renameAccount](catalog))
-	require.NoError(t, goevent.RegisterCommandType[*getAccount](catalog))
-	return catalog
+	require.NoError(t, goevent.RegisterMessageType[*accountCreated](registry))
+	require.NoError(t, goevent.RegisterMessageType[*accountRenamed](registry))
+}
+
+func TestSubjectRoundTrip(t *testing.T) {
+	subj := goevent.Subject{
+		Scope:         "billing",
+		Kind:          goevent.MessageKind("signal"),
+		AggregateType: "account",
+		AggregateID:   "acct-1",
+		Name:          "refresh",
+	}
+	require.Equal(t, "billing.signal.account.acct-1.refresh", subj.String())
+
+	parsed, ok := goeventnats.ParseSubject(subj.String())
+	require.True(t, ok)
+	require.Equal(t, subj, parsed)
+
+	_, ok = goeventnats.ParseSubject("billing.event.account.bad.id.created")
+	require.False(t, ok)
 }
 
 func TestEventStoreCASUsesAggregateSubjectFilter(t *testing.T) {
 	env := natstest.Run(t)
-	catalog := testCatalog(t)
-	env.EnsureEventStream(t, "test", "account", goeventnats.WithMemoryStorage())
+	env.CreateEventStream(t, "test", "account")
 
-	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{Catalog: catalog})
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
 	require.NoError(t, err)
 
 	agg := &account{ID: "acct-1"}
@@ -121,10 +173,9 @@ func TestEventStoreCASUsesAggregateSubjectFilter(t *testing.T) {
 
 func TestEventStoreSavesMultipleEventsAtomically(t *testing.T) {
 	env := natstest.Run(t)
-	catalog := testCatalog(t)
-	env.EnsureEventStream(t, "test", "account", goeventnats.WithMemoryStorage())
+	env.CreateEventStream(t, "test", "account")
 
-	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{Catalog: catalog})
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
 	require.NoError(t, err)
 
 	agg := &account{ID: "acct-1"}
@@ -140,50 +191,106 @@ func TestEventStoreSavesMultipleEventsAtomically(t *testing.T) {
 	require.Equal(t, "Fresh", loaded.Name)
 }
 
+func TestEventStoreSupportsCustomEventKind(t *testing.T) {
+	env := natstest.Run(t)
+	env.CreateMessageStream(t, "test", "log", "worker")
+
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
+	require.NoError(t, err)
+
+	agg := &workerLog{ID: "worker-1"}
+	require.NoError(t, store.Save(t.Context(), agg, 0, &logEmitted{
+		WorkerID: "worker-1",
+		Level:    "info",
+		Message:  "started",
+	}))
+
+	loaded := &workerLog{ID: "worker-1"}
+	version, err := store.Load(t.Context(), loaded)
+	require.NoError(t, err)
+	require.NotZero(t, version)
+	require.Equal(t, "started", loaded.Message)
+
+	stream, err := env.JetStream.Stream(t.Context(), goeventnats.StreamName(goeventnats.DefaultStreamPattern, "test", "worker"))
+	require.NoError(t, err)
+	msg, err := stream.GetMsg(t.Context(), version)
+	require.NoError(t, err)
+	require.Equal(t, "test.log.worker.worker-1.info", msg.Subject)
+}
+
+func TestEventStoreLoadUsesAggregateEventTypes(t *testing.T) {
+	env := natstest.Run(t)
+	env.CreateEventStream(t, "test", "account")
+
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
+	require.NoError(t, err)
+
+	agg := &account{ID: "acct-1"}
+	require.NoError(t, store.Save(t.Context(), agg, 0, &accountCreated{AccountID: "acct-1", Name: "Acme"}))
+
+	_, err = store.Load(t.Context(), &accountWithoutEventTypes{account: account{ID: "acct-1"}})
+	require.Error(t, err)
+	var unknown *goevent.UnknownEventError
+	require.ErrorAs(t, err, &unknown)
+
+	err = goevent.Execute(t.Context(), store,
+		func() *account {
+			return &account{ID: "acct-1"}
+		},
+		func(ctx context.Context, agg *account, version, attempt uint64) ([]goevent.Event, error) {
+			require.Equal(t, "Acme", agg.Name)
+			return []goevent.Event{&accountRenamed{AccountID: agg.ID, Name: "Fresh"}}, nil
+		},
+	)
+	require.NoError(t, err)
+
+	loaded := &account{ID: "acct-1"}
+	_, err = store.Load(t.Context(), loaded)
+	require.NoError(t, err)
+	require.Equal(t, "Fresh", loaded.Name)
+}
+
 func TestNATSBusEndToEnd(t *testing.T) {
 	env := natstest.Run(t)
-	catalog := testCatalog(t)
-	env.EnsureEventStream(t, "test", "account", goeventnats.WithMemoryStorage())
+	env.CreateEventStream(t, "test", "account")
 
-	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{Catalog: catalog})
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
 	require.NoError(t, err)
 	dispatcher, err := goeventnats.NewDispatcher(env.Conn, goeventnats.DispatcherConfig{RequestTimeout: 2 * time.Second})
 	require.NoError(t, err)
-	commandSub, err := goeventnats.NewCommandSubscriber(env.Conn, goeventnats.CommandSubscriberConfig{Catalog: catalog, Queue: "svc"})
+	publisher, err := goeventnats.NewPublisher(env.Conn, goeventnats.PublisherConfig{})
 	require.NoError(t, err)
-	eventSub, err := goeventnats.NewSubscriber(env.Conn, goeventnats.SubscriberConfig{Catalog: catalog})
+	commandSub, err := goeventnats.NewCommandSubscriber(env.Conn, goeventnats.CommandSubscriberConfig{Queue: "svc"})
+	require.NoError(t, err)
+	eventSub, err := goeventnats.NewSubscriber(env.Conn, goeventnats.SubscriberConfig{})
 	require.NoError(t, err)
 
-	bus := goevent.NewBus(dispatcher, commandSub, eventSub, goevent.BusOptions{Catalog: catalog, Queue: "svc"})
+	bus := goevent.NewBus(dispatcher, publisher, commandSub, eventSub, goevent.BusOptions{Queue: "svc"})
 
 	commandSeen := make(chan string, 1)
-	_, err = goevent.CommandHandlerOf(bus, func(ctx context.Context, cmd *renameAccount) error {
+	goevent.HandleCommand(bus, func(ctx context.Context, cmd *renameAccount) error {
 		commandSeen <- cmd.Name
 		return nil
 	})
-	require.NoError(t, err)
 
-	_, err = goevent.QueryHandlerOf(bus, func(ctx context.Context, query *getAccount) (accountView, error) {
+	goevent.HandleQuery(bus, func(ctx context.Context, query *getAccount) (accountView, error) {
 		return accountView{ID: query.AccountID}, nil
 	})
-	require.NoError(t, err)
 
 	orderedSeen := make(chan string, 1)
-	_, err = goevent.EventHandlerOf(bus, func(ctx context.Context, evt *accountCreated) error {
+	goevent.HandleEvent(bus, func(ctx context.Context, evt *accountCreated) error {
 		orderedSeen <- evt.AccountID
 		return nil
 	})
-	require.NoError(t, err)
 
 	queueSeen := make(chan string, 1)
-	_, err = goevent.QueueEventHandlerOf(bus, func(ctx context.Context, evt *accountCreated) error {
+	goevent.HandleQueueEvent(bus, func(ctx context.Context, evt *accountCreated) error {
 		queueSeen <- evt.AccountID
 		return nil
 	})
-	require.NoError(t, err)
 
-	require.NoError(t, bus.Start(t.Context()))
-	t.Cleanup(func() { require.NoError(t, bus.Stop(context.Background())) })
+	require.NoError(t, bus.Connect(t.Context()))
+	t.Cleanup(func() { require.NoError(t, bus.Disconnect()) })
 
 	require.NoError(t, bus.DispatchCommand(t.Context(), &renameAccount{AccountID: "acct-1", Name: "Fresh"}))
 	require.Equal(t, "Fresh", receive(t, commandSeen))
@@ -197,15 +304,69 @@ func TestNATSBusEndToEnd(t *testing.T) {
 	require.Equal(t, "acct-1", receive(t, queueSeen))
 }
 
+func TestNewBusConstructsNATSPrimitives(t *testing.T) {
+	env := natstest.Run(t)
+	env.CreateEventStream(t, "test", "account")
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
+	require.NoError(t, err)
+
+	bus, err := goeventnats.NewBus(env.Conn, goeventnats.BusConfig{Queue: "svc"})
+	require.NoError(t, err)
+
+	commandSeen := make(chan string, 1)
+	goevent.HandleCommand(bus, func(ctx context.Context, cmd *renameAccount) error {
+		commandSeen <- cmd.Name
+		return nil
+	})
+
+	eventSeen := make(chan string, 1)
+	goevent.HandleEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+		eventSeen <- evt.AccountID
+		return nil
+	})
+
+	require.NoError(t, bus.Connect(t.Context()))
+	t.Cleanup(func() { require.NoError(t, bus.Disconnect()) })
+
+	require.NoError(t, bus.DispatchCommand(t.Context(), &renameAccount{AccountID: "acct-1", Name: "Fresh"}))
+	require.Equal(t, "Fresh", receive(t, commandSeen))
+
+	require.NoError(t, store.Save(t.Context(), &account{ID: "acct-1"}, 0, &accountCreated{AccountID: "acct-1", Name: "Acme"}))
+	require.Equal(t, "acct-1", receive(t, eventSeen))
+}
+
+func TestNATSBusPublishDeliversCustomEventKind(t *testing.T) {
+	env := natstest.Run(t)
+	env.CreateMessageStream(t, "test", "log", "worker")
+
+	bus, err := goeventnats.NewBus(env.Conn, goeventnats.BusConfig{Queue: "logger"})
+	require.NoError(t, err)
+
+	seen := make(chan string, 1)
+	goevent.HandleQueueEvent(bus, func(ctx context.Context, evt *logEmitted) error {
+		seen <- evt.Message
+		return nil
+	})
+	require.NoError(t, bus.Connect(t.Context()))
+	t.Cleanup(func() { require.NoError(t, bus.Disconnect()) })
+
+	require.NoError(t, bus.Publish(t.Context(), &logEmitted{
+		WorkerID: "worker-1",
+		Level:    "info",
+		Message:  "started",
+	}))
+	require.Equal(t, "started", receive(t, seen))
+}
+
 func TestQueueSubscriptionCreatesConsumerPerFilter(t *testing.T) {
 	env := natstest.Run(t)
-	catalog := testCatalog(t)
-	stream := env.EnsureEventStream(t, "test", "account", goeventnats.WithMemoryStorage())
+	stream := env.CreateEventStream(t, "test", "account")
 	info, err := stream.Info(t.Context())
 	require.NoError(t, err)
 
-	subscriber, err := goeventnats.NewSubscriber(env.Conn, goeventnats.SubscriberConfig{Catalog: catalog})
+	subscriber, err := goeventnats.NewSubscriber(env.Conn, goeventnats.SubscriberConfig{})
 	require.NoError(t, err)
+	registerAccountEvents(t, subscriber)
 	sub, err := subscriber.SubscribeEvents(t.Context(), goevent.EventHandlerFunc(func(ctx context.Context, evt goevent.Event, cursor []byte) error {
 		return nil
 	}), goevent.EventSubscriptionConfig{
@@ -216,7 +377,7 @@ func TestQueueSubscriptionCreatesConsumerPerFilter(t *testing.T) {
 		ConsumerName:   "projection_account",
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, sub.Stop(context.Background())) })
+	t.Cleanup(func() { require.NoError(t, sub.Stop()) })
 
 	var names []string
 	require.Eventually(t, func() bool {
@@ -237,9 +398,34 @@ func TestQueueSubscriptionCreatesConsumerPerFilter(t *testing.T) {
 	}
 }
 
+func TestNATSBusQueueHandlerSupportsCustomEventKind(t *testing.T) {
+	env := natstest.Run(t)
+	env.CreateMessageStream(t, "test", "log", "worker")
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
+	require.NoError(t, err)
+	eventSub, err := goeventnats.NewSubscriber(env.Conn, goeventnats.SubscriberConfig{})
+	require.NoError(t, err)
+	bus := goevent.NewBus(nil, nil, nil, eventSub, goevent.BusOptions{Queue: "logger"})
+
+	seen := make(chan string, 1)
+	goevent.HandleQueueEvent(bus, func(ctx context.Context, evt *logEmitted) error {
+		seen <- evt.Message
+		return nil
+	})
+	require.NoError(t, bus.Connect(t.Context()))
+	t.Cleanup(func() { require.NoError(t, bus.Disconnect()) })
+
+	require.NoError(t, store.Save(t.Context(), &workerLog{ID: "worker-1"}, 0, &logEmitted{
+		WorkerID: "worker-1",
+		Level:    "info",
+		Message:  "started",
+	}))
+	require.Equal(t, "started", receive(t, seen))
+}
+
 func BenchmarkRawJetStreamSubscription(b *testing.B) {
 	env := natstest.Run(b)
-	env.EnsureEventStream(b, "test", "account", goeventnats.WithMemoryStorage())
+	env.CreateEventStream(b, "test", "account")
 	var count atomic.Uint64
 	consumer, err := env.JetStream.CreateOrUpdateConsumer(b.Context(), goeventnats.StreamName(goeventnats.DefaultStreamPattern, "test", "account"), jetstream.ConsumerConfig{
 		Name:          "raw",
@@ -269,10 +455,10 @@ func BenchmarkRawJetStreamSubscription(b *testing.B) {
 
 func BenchmarkMessageBusSubscription(b *testing.B) {
 	env := natstest.Run(b)
-	catalog := testCatalog(b)
-	env.EnsureEventStream(b, "test", "account", goeventnats.WithMemoryStorage())
-	subscriber, err := goeventnats.NewSubscriber(env.Conn, goeventnats.SubscriberConfig{Catalog: catalog})
+	env.CreateEventStream(b, "test", "account")
+	subscriber, err := goeventnats.NewSubscriber(env.Conn, goeventnats.SubscriberConfig{})
 	require.NoError(b, err)
+	registerAccountEvents(b, subscriber)
 	var count atomic.Uint64
 	sub, err := subscriber.SubscribeEvents(b.Context(), goevent.EventHandlerFunc(func(ctx context.Context, evt goevent.Event, cursor []byte) error {
 		count.Add(1)
@@ -285,7 +471,7 @@ func BenchmarkMessageBusSubscription(b *testing.B) {
 		ConsumerName:   "bench",
 	})
 	require.NoError(b, err)
-	defer func() { _ = sub.Stop(context.Background()) }()
+	defer func() { _ = sub.Stop() }()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

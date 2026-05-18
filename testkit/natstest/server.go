@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	goevent "github.com/dpotapov/go-event"
 	goeventnats "github.com/dpotapov/go-event/nats"
 	"github.com/nats-io/nats-server/v2/server"
 	natsserver "github.com/nats-io/nats-server/v2/test"
@@ -71,13 +72,36 @@ func (s *Server) Close() {
 	}
 }
 
-func (s *Server) EnsureEventStream(t testing.TB, scope, aggregateType string, opts ...goeventnats.StreamOption) jetstream.Stream {
+type streamInfo struct {
+	scope         string
+	kind          string
+	aggregateType string
+}
+
+func (s streamInfo) AggregateScope() string { return s.scope }
+func (s streamInfo) AggregateType() string  { return s.aggregateType }
+func (s streamInfo) MessageKind() string    { return s.kind }
+
+func (s *Server) CreateEventStream(t testing.TB, scope, aggregateType string) jetstream.Stream {
+	t.Helper()
+	return s.CreateMessageStream(t, scope, string(goevent.KindEvent), aggregateType)
+}
+
+func (s *Server) CreateMessageStream(t testing.TB, scope, kind, aggregateType string) jetstream.Stream {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	stream, err := goeventnats.EnsureEventStream(ctx, s.JetStream, scope, aggregateType, opts...)
+	cfg := jetstream.StreamConfig{
+		Name:               goeventnats.StreamName(goeventnats.DefaultStreamPattern, scope, aggregateType),
+		Storage:            jetstream.MemoryStorage,
+		Retention:          jetstream.LimitsPolicy,
+		AllowDirect:        true,
+		AllowAtomicPublish: true,
+	}
+	goeventnats.SetStreamSubjects(&cfg, streamInfo{scope: scope, kind: kind, aggregateType: aggregateType})
+	stream, err := s.JetStream.CreateOrUpdateStream(ctx, cfg)
 	if err != nil {
-		t.Fatalf("ensure event stream: %v", err)
+		t.Fatalf("ensure message stream: %v", err)
 	}
 	return stream
 }

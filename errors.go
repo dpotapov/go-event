@@ -56,7 +56,7 @@ func (e *UnknownCommandError) Is(target error) bool {
 }
 
 type SubscriptionError struct {
-	Address          Address
+	Subject          Subject
 	Queue            string
 	NumDelivered     uint64
 	RetriesExhausted bool

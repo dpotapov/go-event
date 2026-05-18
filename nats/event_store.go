@@ -23,7 +23,6 @@ const (
 )
 
 type EventStoreConfig struct {
-	Catalog       *goevent.Catalog
 	StreamPattern string
 	Logger        *slog.Logger
 }
@@ -31,12 +30,11 @@ type EventStoreConfig struct {
 type EventStore struct {
 	nc            *gonats.Conn
 	js            jetstream.JetStream
-	catalog       *goevent.Catalog
 	streamPattern string
 	logger        *slog.Logger
 }
 
-var _ goevent.EventStore = (*EventStore)(nil)
+var _ goevent.Store = (*EventStore)(nil)
 
 func NewEventStore(nc *gonats.Conn, cfg EventStoreConfig) (*EventStore, error) {
 	if nc == nil {
@@ -45,10 +43,6 @@ func NewEventStore(nc *gonats.Conn, cfg EventStoreConfig) (*EventStore, error) {
 	js, err := jetstream.New(nc)
 	if err != nil {
 		return nil, fmt.Errorf("create jetstream context: %w", err)
-	}
-	catalog := cfg.Catalog
-	if catalog == nil {
-		catalog = goevent.NewCatalog()
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -61,19 +55,12 @@ func NewEventStore(nc *gonats.Conn, cfg EventStoreConfig) (*EventStore, error) {
 	return &EventStore{
 		nc:            nc,
 		js:            js,
-		catalog:       catalog,
 		streamPattern: pattern,
 		logger:        logger,
 	}, nil
 }
 
-func (s *EventStore) EnsureStream(ctx context.Context, scope, aggregateType string, opts ...StreamOption) (jetstream.Stream, error) {
-	options := []StreamOption{WithStreamPattern(s.streamPattern, scope, aggregateType)}
-	options = append(options, opts...)
-	return EnsureEventStream(ctx, s.js, scope, aggregateType, options...)
-}
-
-func (s *EventStore) Save(ctx context.Context, agg goevent.Aggregate, expectedVersion uint64, events ...goevent.Event) error {
+func (s *EventStore) Save(ctx context.Context, agg goevent.AggregateRef, expectedVersion uint64, events ...goevent.Event) error {
 	if len(events) == 0 {
 		return nil
 	}
@@ -86,9 +73,13 @@ func (s *EventStore) Save(ctx context.Context, agg goevent.Aggregate, expectedVe
 	return s.publishBatch(ctx, agg, expectedVersion, events)
 }
 
-func (s *EventStore) Load(ctx context.Context, agg goevent.Aggregate) (uint64, error) {
+func (s *EventStore) Load(ctx context.Context, agg goevent.ESAggregate) (uint64, error) {
+	registry, err := eventRegistryFor(agg)
+	if err != nil {
+		return 0, err
+	}
 	streamName := s.streamFor(agg.AggregateScope(), agg.AggregateType())
-	filter := AggregateEventFilter(agg.AggregateScope(), agg.AggregateType(), agg.AggregateID())
+	filter := AggregateMessageFilter(agg.AggregateScope(), agg.AggregateType(), agg.AggregateID())
 	stream, err := s.js.Stream(ctx, streamName)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrStreamNotFound) {
@@ -125,26 +116,24 @@ func (s *EventStore) Load(ctx context.Context, agg goevent.Aggregate) (uint64, e
 			return 0, fmt.Errorf("read event metadata: %w", err)
 		}
 		version = meta.Sequence.Stream
-		evt, err := s.decodeEvent(msg.Subject(), msg.Data(), meta.Timestamp)
+		evt, err := s.decodeEvent(registry, msg.Subject(), msg.Data(), meta.Timestamp)
 		if err != nil {
 			return 0, err
 		}
-		if err := agg.Apply(evt); err != nil {
-			return 0, fmt.Errorf("apply event at sequence %d: %w", version, err)
-		}
+		agg.Apply(evt)
 		if meta.NumPending == 0 {
 			return version, nil
 		}
 	}
 }
 
-func (s *EventStore) publishOne(ctx context.Context, agg goevent.Aggregate, expectedVersion uint64, evt goevent.Event) error {
+func (s *EventStore) publishOne(ctx context.Context, agg goevent.AggregateRef, expectedVersion uint64, evt goevent.Event) error {
 	data, err := marshalEvent(evt)
 	if err != nil {
 		return err
 	}
-	subject := EventSubject(evt.AggregateScope(), evt.AggregateType(), evt.AggregateID(), evt.EventName())
-	filter := AggregateEventFilter(agg.AggregateScope(), agg.AggregateType(), agg.AggregateID())
+	subject := goevent.EventSubject(evt).String()
+	filter := AggregateMessageFilter(agg.AggregateScope(), agg.AggregateType(), agg.AggregateID())
 	msg := gonats.NewMsg(subject)
 	msg.Data = data
 	_, err = s.js.PublishMsg(ctx, msg,
@@ -157,17 +146,18 @@ func (s *EventStore) publishOne(ctx context.Context, agg goevent.Aggregate, expe
 	return nil
 }
 
-func (s *EventStore) publishBatch(ctx context.Context, agg goevent.Aggregate, expectedVersion uint64, events []goevent.Event) error {
+func (s *EventStore) publishBatch(ctx context.Context, agg goevent.AggregateRef, expectedVersion uint64, events []goevent.Event) error {
 	batchID := nuid.Next()
-	filter := AggregateEventFilter(agg.AggregateScope(), agg.AggregateType(), agg.AggregateID())
+	filter := AggregateMessageFilter(agg.AggregateScope(), agg.AggregateType(), agg.AggregateID())
 	stream := s.streamFor(agg.AggregateScope(), agg.AggregateType())
 
 	for i, evt := range events {
+		subj := goevent.EventSubject(evt)
 		data, err := marshalEvent(evt)
 		if err != nil {
 			return err
 		}
-		msg := gonats.NewMsg(EventSubject(evt.AggregateScope(), evt.AggregateType(), evt.AggregateID(), evt.EventName()))
+		msg := gonats.NewMsg(subj.String())
 		msg.Data = data
 		msg.Header.Set(batchIDHeader, batchID)
 		msg.Header.Set(batchSeqHeader, strconv.Itoa(i+1))
@@ -193,12 +183,12 @@ func (s *EventStore) publishBatch(ctx context.Context, agg goevent.Aggregate, ex
 	return nil
 }
 
-func (s *EventStore) decodeEvent(subject string, data []byte, timestamp time.Time) (goevent.Event, error) {
-	addr, ok := parseAddress(subject)
-	if !ok || addr.Kind != goevent.KindEvent {
+func (s *EventStore) decodeEvent(registry goevent.DecoderRegistry, subject string, data []byte, timestamp time.Time) (goevent.Event, error) {
+	subj, ok := ParseSubject(subject)
+	if !ok {
 		return nil, fmt.Errorf("invalid event subject %q", subject)
 	}
-	evt, err := s.catalog.NewEvent(addr.Scope, addr.AggregateType, addr.Name)
+	evt, err := registry.NewEvent(subj.Kind, subj.Scope, subj.AggregateType, subj.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -222,18 +212,28 @@ func marshalEvent(evt goevent.Event) ([]byte, error) {
 	if codec, ok := evt.(Codec); ok {
 		data, err := codec.NATSMarshal()
 		if err != nil {
-			return nil, fmt.Errorf("marshal event %s: %w", goevent.EventAddress(evt).Subject(), err)
+			return nil, fmt.Errorf("marshal event %s: %w", goevent.EventSubject(evt), err)
 		}
 		return data, nil
 	}
 	data, err := json.Marshal(evt)
 	if err != nil {
-		return nil, fmt.Errorf("marshal event %s: %w", goevent.EventAddress(evt).Subject(), err)
+		return nil, fmt.Errorf("marshal event %s: %w", goevent.EventSubject(evt), err)
 	}
 	return data, nil
 }
 
-func validateEvents(agg goevent.Aggregate, events []goevent.Event) error {
+func eventRegistryFor(agg goevent.ESAggregate) (goevent.DecoderRegistry, error) {
+	registry := goevent.NewTypeRegistry()
+	for i, evt := range agg.EventTypes() {
+		if err := registry.RegisterMessageType(evt); err != nil {
+			return nil, fmt.Errorf("register event type %d: %w", i, err)
+		}
+	}
+	return registry, nil
+}
+
+func validateEvents(agg goevent.AggregateRef, events []goevent.Event) error {
 	for i, evt := range events {
 		if evt.AggregateScope() != agg.AggregateScope() ||
 			evt.AggregateType() != agg.AggregateType() ||
@@ -241,7 +241,7 @@ func validateEvents(agg goevent.Aggregate, events []goevent.Event) error {
 			return fmt.Errorf("event %d does not belong to aggregate %s.%s.%s", i,
 				agg.AggregateScope(), agg.AggregateType(), agg.AggregateID())
 		}
-		if err := goevent.EventAddress(evt).Validate(); err != nil {
+		if err := goevent.EventSubject(evt).Validate(); err != nil {
 			return err
 		}
 	}

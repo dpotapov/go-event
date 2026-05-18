@@ -17,8 +17,8 @@ const (
 
 var ErrInvalidName = errors.New("invalid message name")
 
-// Address is the transport-neutral location of a command, query, or event.
-type Address struct {
+// Subject is the transport-neutral delivery subject of a command, query, or event.
+type Subject struct {
 	Scope         string
 	Kind          MessageKind
 	AggregateType string
@@ -26,78 +26,72 @@ type Address struct {
 	Name          string
 }
 
-func EventAddress(evt Event) Address {
-	return Address{
+func EventSubject(evt Event) Subject {
+	return Subject{
 		Scope:         evt.AggregateScope(),
-		Kind:          KindEvent,
+		Kind:          messageKind(evt, KindEvent),
 		AggregateType: evt.AggregateType(),
 		AggregateID:   evt.AggregateID(),
 		Name:          evt.EventName(),
 	}
 }
 
-func CommandAddress(cmd Command) Address {
-	return Address{
+func CommandSubject(cmd Command) Subject {
+	return Subject{
 		Scope:         cmd.AggregateScope(),
-		Kind:          KindCommand,
+		Kind:          messageKind(cmd, KindCommand),
 		AggregateType: cmd.AggregateType(),
 		AggregateID:   cmd.AggregateID(),
 		Name:          cmd.CommandName(),
 	}
 }
 
-func QueryAddress(query Command) Address {
-	return Address{
+func QuerySubject(query Command) Subject {
+	return Subject{
 		Scope:         query.AggregateScope(),
-		Kind:          KindQuery,
+		Kind:          messageKind(query, KindQuery),
 		AggregateType: query.AggregateType(),
 		AggregateID:   query.AggregateID(),
 		Name:          query.CommandName(),
 	}
 }
 
-func (a Address) Subject() string {
+func messageKind(msg any, defaultKind MessageKind) MessageKind {
+	if provider, ok := msg.(MessageKindOverride); ok {
+		if kind := provider.MessageKind(); kind != "" {
+			return MessageKind(kind)
+		}
+	}
+	return defaultKind
+}
+
+func (s Subject) String() string {
 	return strings.Join([]string{
-		a.Scope,
-		string(a.Kind),
-		a.AggregateType,
-		a.AggregateID,
-		a.Name,
+		s.Scope,
+		string(s.Kind),
+		s.AggregateType,
+		s.AggregateID,
+		s.Name,
 	}, ".")
 }
 
-func (a Address) Validate() error {
-	if err := ValidateToken("scope", a.Scope); err != nil {
+func (s Subject) Validate() error {
+	if err := ValidateToken("scope", s.Scope); err != nil {
 		return err
 	}
-	if err := ValidateToken("kind", string(a.Kind)); err != nil {
+	if err := ValidateToken("kind", string(s.Kind)); err != nil {
 		return err
 	}
-	if err := ValidateToken("aggregate type", a.AggregateType); err != nil {
+	if err := ValidateToken("aggregate type", s.AggregateType); err != nil {
 		return err
 	}
-	if err := ValidateToken("aggregate id", a.AggregateID); err != nil {
+	if err := ValidateToken("aggregate id", s.AggregateID); err != nil {
 		return err
 	}
-	if err := ValidateToken("name", a.Name); err != nil {
+	if err := ValidateToken("name", s.Name); err != nil {
 		return err
 	}
 	return nil
-}
-
-func ParseSubject(subject string) (Address, bool) {
-	parts := strings.Split(subject, ".")
-	if len(parts) != 5 {
-		return Address{}, false
-	}
-	addr := Address{
-		Scope:         parts[0],
-		Kind:          MessageKind(parts[1]),
-		AggregateType: parts[2],
-		AggregateID:   parts[3],
-		Name:          parts[4],
-	}
-	return addr, addr.Validate() == nil
 }
 
 // ValidateToken checks one concrete subject token. Wildcards are intentionally

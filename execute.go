@@ -30,9 +30,9 @@ func WithExecuteBackoff(baseDelay, maxDelay time.Duration) ExecuteOption {
 // Execute loads a fresh aggregate, runs mutate, and saves the produced events
 // with optimistic concurrency. newAggregate is called for every retry so a
 // failed attempt never leaks partially applied state into the next attempt.
-func Execute[A Aggregate](
+func Execute[A ESAggregate](
 	ctx context.Context,
-	store EventStore,
+	store Store,
 	newAggregate func() A,
 	mutate func(context.Context, A, uint64, uint64) ([]Event, error),
 	opts ...ExecuteOption,
@@ -91,10 +91,7 @@ func Execute[A Aggregate](
 }
 
 func sleepBackoff(ctx context.Context, cfg ExecuteConfig, attempt int) error {
-	delay := cfg.BaseDelay * (1 << min(attempt, 30))
-	if delay > cfg.MaxDelay {
-		delay = cfg.MaxDelay
-	}
+	delay := min(cfg.BaseDelay*(1<<min(attempt, 30)), cfg.MaxDelay)
 	if delay > 0 {
 		delay = time.Duration(rand.Int64N(int64(delay)))
 	}
