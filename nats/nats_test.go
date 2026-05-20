@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	goevent "github.com/dpotapov/go-event"
+	"github.com/dpotapov/go-event"
 	goeventnats "github.com/dpotapov/go-event/nats"
 	"github.com/dpotapov/go-event/testkit/natstest"
 	"github.com/nats-io/nats.go/jetstream"
@@ -24,10 +24,10 @@ type account struct {
 func (a *account) AggregateScope() string { return "test" }
 func (a *account) AggregateType() string  { return "account" }
 func (a *account) AggregateID() string    { return a.ID }
-func (a *account) EventTypes() []goevent.Event {
-	return []goevent.Event{&accountCreated{}, &accountRenamed{}}
+func (a *account) EventTypes() ([]event.Event, event.SnapshotEvent) {
+	return []event.Event{&accountCreated{}, &accountRenamed{}}, nil
 }
-func (a *account) Apply(evt goevent.Event) {
+func (a *account) Apply(evt event.Event) {
 	switch e := evt.(type) {
 	case *accountCreated:
 		a.Name = e.Name
@@ -56,6 +56,43 @@ func (e *accountRenamed) AggregateType() string  { return "account" }
 func (e *accountRenamed) AggregateID() string    { return e.AccountID }
 func (e *accountRenamed) EventName() string      { return "renamed" }
 
+type accountSnapshot struct {
+	event.SnapshotEventBase
+
+	AccountID string `json:"account_id"`
+	Name      string `json:"name"`
+}
+
+func (e *accountSnapshot) AggregateScope() string { return "test" }
+func (e *accountSnapshot) AggregateType() string  { return "account" }
+func (e *accountSnapshot) AggregateID() string    { return e.AccountID }
+
+type snapshottedAccount struct {
+	ID   string
+	Name string
+}
+
+func (a *snapshottedAccount) AggregateScope() string { return "test" }
+func (a *snapshottedAccount) AggregateType() string  { return "account" }
+func (a *snapshottedAccount) AggregateID() string    { return a.ID }
+func (a *snapshottedAccount) EventTypes() ([]event.Event, event.SnapshotEvent) {
+	return []event.Event{&accountCreated{}, &accountRenamed{}}, &accountSnapshot{}
+}
+func (a *snapshottedAccount) Apply(evt event.Event) {
+	switch e := evt.(type) {
+	case *accountCreated:
+		a.Name = e.Name
+	case *accountRenamed:
+		a.Name = e.Name
+	case *accountSnapshot:
+		a.ID = e.AccountID
+		a.Name = e.Name
+	}
+}
+func (a *snapshottedAccount) TakeSnapshot() (event.SnapshotEvent, error) {
+	return &accountSnapshot{AccountID: a.ID, Name: a.Name}, nil
+}
+
 type logEmitted struct {
 	WorkerID string `json:"worker_id"`
 	Level    string `json:"level"`
@@ -76,10 +113,10 @@ type workerLog struct {
 func (w *workerLog) AggregateScope() string { return "test" }
 func (w *workerLog) AggregateType() string  { return "worker" }
 func (w *workerLog) AggregateID() string    { return w.ID }
-func (w *workerLog) EventTypes() []goevent.Event {
-	return []goevent.Event{&logEmitted{}}
+func (w *workerLog) EventTypes() ([]event.Event, event.SnapshotEvent) {
+	return []event.Event{&logEmitted{}}, nil
 }
-func (w *workerLog) Apply(evt goevent.Event) {
+func (w *workerLog) Apply(evt event.Event) {
 	if e, ok := evt.(*logEmitted); ok {
 		w.Message = e.Message
 	}
@@ -115,20 +152,20 @@ type accountWithoutEventTypes struct {
 	account
 }
 
-func (a *accountWithoutEventTypes) EventTypes() []goevent.Event {
-	return nil
+func (a *accountWithoutEventTypes) EventTypes() ([]event.Event, event.SnapshotEvent) {
+	return nil, nil
 }
 
-func registerAccountEvents(t testing.TB, registry goevent.TypeRegistry) {
+func registerAccountEvents(t testing.TB, registry event.TypeRegistry) {
 	t.Helper()
-	require.NoError(t, goevent.RegisterMessageType[*accountCreated](registry))
-	require.NoError(t, goevent.RegisterMessageType[*accountRenamed](registry))
+	require.NoError(t, event.RegisterMessageType[*accountCreated](registry))
+	require.NoError(t, event.RegisterMessageType[*accountRenamed](registry))
 }
 
 func TestSubjectRoundTrip(t *testing.T) {
-	subj := goevent.Subject{
+	subj := event.Subject{
 		Scope:         "billing",
-		Kind:          goevent.MessageKind("signal"),
+		Kind:          event.MessageKind("signal"),
 		AggregateType: "account",
 		AggregateID:   "acct-1",
 		Name:          "refresh",
@@ -161,7 +198,7 @@ func TestEventStoreCASUsesAggregateSubjectFilter(t *testing.T) {
 
 	err = store.Save(t.Context(), agg, 0, &accountRenamed{AccountID: "acct-1", Name: "Stale"})
 	require.Error(t, err)
-	require.True(t, errors.Is(err, goevent.ErrConflict), "expected conflict, got %v", err)
+	require.True(t, errors.Is(err, event.ErrConflict), "expected conflict, got %v", err)
 
 	require.NoError(t, store.Save(t.Context(), agg, version, &accountRenamed{AccountID: "acct-1", Name: "Fresh"}))
 	loaded = &account{ID: "acct-1"}
@@ -191,31 +228,61 @@ func TestEventStoreSavesMultipleEventsAtomically(t *testing.T) {
 	require.Equal(t, "Fresh", loaded.Name)
 }
 
-func TestEventStoreSupportsCustomEventKind(t *testing.T) {
-	env := natstest.Run(t)
-	env.CreateMessageStream(t, "test", "log", "worker")
+func TestAggregateMessageFilterUsesEventKind(t *testing.T) {
+	require.Equal(t, "test.event.worker.worker-1.>", goeventnats.AggregateMessageFilter("test", "worker", "worker-1"))
+}
 
-	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
+func TestEventStoreImplicitSnapshotLoadReplaysTail(t *testing.T) {
+	env := natstest.Run(t)
+	env.CreateEventStream(t, "test", "account")
+
+	snapshotStore, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{SnapshotEvery: 1})
 	require.NoError(t, err)
 
-	agg := &workerLog{ID: "worker-1"}
-	require.NoError(t, store.Save(t.Context(), agg, 0, &logEmitted{
-		WorkerID: "worker-1",
-		Level:    "info",
-		Message:  "started",
-	}))
+	agg := &account{ID: "acct-1"}
+	require.NoError(t, snapshotStore.Save(t.Context(), agg, 0, &accountCreated{AccountID: "acct-1", Name: "Acme"}))
 
-	loaded := &workerLog{ID: "worker-1"}
+	stream, err := env.JetStream.Stream(t.Context(), goeventnats.StreamName(goeventnats.DefaultStreamPattern, "test", "account"))
+	require.NoError(t, err)
+	snap, err := stream.GetLastMsgForSubject(t.Context(), "test.event.account.acct-1.snapshot")
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), snap.Sequence)
+
+	noSnapshotStore, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
+	require.NoError(t, err)
+	require.NoError(t, noSnapshotStore.Save(t.Context(), agg, snap.Sequence, &accountRenamed{AccountID: "acct-1", Name: "Fresh"}))
+
+	loaded := &account{ID: "acct-1"}
+	version, err := snapshotStore.Load(t.Context(), loaded)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), version)
+	require.Equal(t, "Fresh", loaded.Name)
+}
+
+func TestEventStoreExplicitSnapshotLoad(t *testing.T) {
+	env := natstest.Run(t)
+	env.CreateEventStream(t, "test", "account")
+
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{SnapshotEvery: 1})
+	require.NoError(t, err)
+
+	agg := &snapshottedAccount{ID: "acct-1"}
+	require.NoError(t, store.Save(t.Context(), agg, 0, &accountCreated{AccountID: "acct-1", Name: "Acme"}))
+
+	stream, err := env.JetStream.Stream(t.Context(), goeventnats.StreamName(goeventnats.DefaultStreamPattern, "test", "account"))
+	require.NoError(t, err)
+	snap, err := stream.GetLastMsgForSubject(t.Context(), "test.event.account.acct-1.snapshot")
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), snap.Sequence)
+	var decoded accountSnapshot
+	require.NoError(t, json.Unmarshal(snap.Data, &decoded))
+	require.Equal(t, "Acme", decoded.Name)
+
+	loaded := &snapshottedAccount{ID: "acct-1"}
 	version, err := store.Load(t.Context(), loaded)
 	require.NoError(t, err)
-	require.NotZero(t, version)
-	require.Equal(t, "started", loaded.Message)
-
-	stream, err := env.JetStream.Stream(t.Context(), goeventnats.StreamName(goeventnats.DefaultStreamPattern, "test", "worker"))
-	require.NoError(t, err)
-	msg, err := stream.GetMsg(t.Context(), version)
-	require.NoError(t, err)
-	require.Equal(t, "test.log.worker.worker-1.info", msg.Subject)
+	require.Equal(t, snap.Sequence, version)
+	require.Equal(t, "Acme", loaded.Name)
 }
 
 func TestEventStoreLoadUsesAggregateEventTypes(t *testing.T) {
@@ -230,16 +297,16 @@ func TestEventStoreLoadUsesAggregateEventTypes(t *testing.T) {
 
 	_, err = store.Load(t.Context(), &accountWithoutEventTypes{account: account{ID: "acct-1"}})
 	require.Error(t, err)
-	var unknown *goevent.UnknownEventError
+	var unknown *event.UnknownEventError
 	require.ErrorAs(t, err, &unknown)
 
-	err = goevent.Execute(t.Context(), store,
+	err = event.Execute(t.Context(), store,
 		func() *account {
 			return &account{ID: "acct-1"}
 		},
-		func(ctx context.Context, agg *account, version, attempt uint64) ([]goevent.Event, error) {
+		func(ctx context.Context, agg *account, version, attempt uint64) ([]event.Event, error) {
 			require.Equal(t, "Acme", agg.Name)
-			return []goevent.Event{&accountRenamed{AccountID: agg.ID, Name: "Fresh"}}, nil
+			return []event.Event{&accountRenamed{AccountID: agg.ID, Name: "Fresh"}}, nil
 		},
 	)
 	require.NoError(t, err)
@@ -265,26 +332,26 @@ func TestNATSBusEndToEnd(t *testing.T) {
 	eventSub, err := goeventnats.NewSubscriber(env.Conn, goeventnats.SubscriberConfig{})
 	require.NoError(t, err)
 
-	bus := goevent.NewBus(dispatcher, publisher, commandSub, eventSub, goevent.BusOptions{Queue: "svc"})
+	bus := event.NewBus(dispatcher, publisher, commandSub, eventSub, event.BusOptions{Queue: "svc"})
 
 	commandSeen := make(chan string, 1)
-	goevent.HandleCommand(bus, func(ctx context.Context, cmd *renameAccount) error {
+	event.HandleCommand(bus, func(ctx context.Context, cmd *renameAccount) error {
 		commandSeen <- cmd.Name
 		return nil
 	})
 
-	goevent.HandleQuery(bus, func(ctx context.Context, query *getAccount) (accountView, error) {
+	event.HandleQuery(bus, func(ctx context.Context, query *getAccount) (accountView, error) {
 		return accountView{ID: query.AccountID}, nil
 	})
 
 	orderedSeen := make(chan string, 1)
-	goevent.HandleEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+	event.HandleEvent(bus, func(ctx context.Context, evt *accountCreated) error {
 		orderedSeen <- evt.AccountID
 		return nil
 	})
 
 	queueSeen := make(chan string, 1)
-	goevent.HandleQueueEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+	event.HandleQueueEvent(bus, func(ctx context.Context, evt *accountCreated) error {
 		queueSeen <- evt.AccountID
 		return nil
 	})
@@ -295,7 +362,7 @@ func TestNATSBusEndToEnd(t *testing.T) {
 	require.NoError(t, bus.DispatchCommand(t.Context(), &renameAccount{AccountID: "acct-1", Name: "Fresh"}))
 	require.Equal(t, "Fresh", receive(t, commandSeen))
 
-	view, err := goevent.Ask[accountView](t.Context(), bus, &getAccount{AccountID: "acct-1"})
+	view, err := event.Ask[accountView](t.Context(), bus, &getAccount{AccountID: "acct-1"})
 	require.NoError(t, err)
 	require.Equal(t, "acct-1", view.ID)
 
@@ -314,13 +381,13 @@ func TestNewBusConstructsNATSPrimitives(t *testing.T) {
 	require.NoError(t, err)
 
 	commandSeen := make(chan string, 1)
-	goevent.HandleCommand(bus, func(ctx context.Context, cmd *renameAccount) error {
+	event.HandleCommand(bus, func(ctx context.Context, cmd *renameAccount) error {
 		commandSeen <- cmd.Name
 		return nil
 	})
 
 	eventSeen := make(chan string, 1)
-	goevent.HandleEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+	event.HandleEvent(bus, func(ctx context.Context, evt *accountCreated) error {
 		eventSeen <- evt.AccountID
 		return nil
 	})
@@ -343,7 +410,7 @@ func TestNATSBusPublishDeliversCustomEventKind(t *testing.T) {
 	require.NoError(t, err)
 
 	seen := make(chan string, 1)
-	goevent.HandleQueueEvent(bus, func(ctx context.Context, evt *logEmitted) error {
+	event.HandleQueueEvent(bus, func(ctx context.Context, evt *logEmitted) error {
 		seen <- evt.Message
 		return nil
 	})
@@ -367,9 +434,9 @@ func TestQueueSubscriptionCreatesConsumerPerFilter(t *testing.T) {
 	subscriber, err := goeventnats.NewSubscriber(env.Conn, goeventnats.SubscriberConfig{})
 	require.NoError(t, err)
 	registerAccountEvents(t, subscriber)
-	sub, err := subscriber.SubscribeEvents(t.Context(), goevent.EventHandlerFunc(func(ctx context.Context, evt goevent.Event, cursor []byte) error {
+	sub, err := subscriber.SubscribeEvents(t.Context(), event.EventHandlerFunc(func(ctx context.Context, evt event.Event, cursor []byte) error {
 		return nil
-	}), goevent.EventSubscriptionConfig{
+	}), event.EventSubscriptionConfig{
 		AggregateScope: "test",
 		AggregateTypes: []string{"account"},
 		EventNames:     []string{"created", "renamed"},
@@ -405,10 +472,10 @@ func TestNATSBusQueueHandlerSupportsCustomEventKind(t *testing.T) {
 	require.NoError(t, err)
 	eventSub, err := goeventnats.NewSubscriber(env.Conn, goeventnats.SubscriberConfig{})
 	require.NoError(t, err)
-	bus := goevent.NewBus(nil, nil, nil, eventSub, goevent.BusOptions{Queue: "logger"})
+	bus := event.NewBus(nil, nil, nil, eventSub, event.BusOptions{Queue: "logger"})
 
 	seen := make(chan string, 1)
-	goevent.HandleQueueEvent(bus, func(ctx context.Context, evt *logEmitted) error {
+	event.HandleQueueEvent(bus, func(ctx context.Context, evt *logEmitted) error {
 		seen <- evt.Message
 		return nil
 	})
@@ -460,10 +527,10 @@ func BenchmarkMessageBusSubscription(b *testing.B) {
 	require.NoError(b, err)
 	registerAccountEvents(b, subscriber)
 	var count atomic.Uint64
-	sub, err := subscriber.SubscribeEvents(b.Context(), goevent.EventHandlerFunc(func(ctx context.Context, evt goevent.Event, cursor []byte) error {
+	sub, err := subscriber.SubscribeEvents(b.Context(), event.EventHandlerFunc(func(ctx context.Context, evt event.Event, cursor []byte) error {
 		count.Add(1)
 		return nil
-	}), goevent.EventSubscriptionConfig{
+	}), event.EventSubscriptionConfig{
 		AggregateScope: "test",
 		AggregateTypes: []string{"account"},
 		EventNames:     []string{"created"},

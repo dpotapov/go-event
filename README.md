@@ -141,8 +141,8 @@ type Order struct {
 	Created bool
 }
 
-func (*Order) EventTypes() []event.Event {
-	return []event.Event{&OrderCreatedEvent{}}
+func (*Order) EventTypes() ([]event.Event, event.SnapshotEvent) {
+	return []event.Event{&OrderCreatedEvent{}}, nil
 }
 
 func (o *Order) Apply(evt event.Event) {
@@ -246,6 +246,57 @@ different event names for the same aggregate share one CAS boundary.
 
 When saving multiple events, the NATS backend uses `Nats-Batch-Id`,
 `Nats-Batch-Sequence`, and `Nats-Batch-Commit` so the batch commits atomically.
+
+## Event Store Snapshots
+
+The NATS event store can write snapshot events to the same aggregate stream. A
+snapshot uses the normal event kind and defaults to this subject:
+
+```text
+<scope>.event.<aggregate-type>.<aggregate-id>.snapshot
+```
+
+Enable automatic snapshot writes with `EventStoreConfig.SnapshotEvery`. When the
+latest event sequence is at least `SnapshotEvery` ahead of the latest snapshot
+sequence, the store writes a new snapshot after a successful save. Snapshot write
+failures are logged because the domain events were already committed.
+
+On load, the store reads the latest snapshot with JetStream direct get-last and
+then replays only events after that snapshot sequence. `SnapshotEvery` only
+controls writes; existing snapshots are used on load even when automatic writes
+are disabled.
+
+There are two snapshot styles:
+
+- **Implicit snapshots:** aggregates do not implement `Snapshottable`; the store
+  stores the aggregate value itself. On replay, snapshot bytes are decoded
+  directly into the aggregate and `Apply` is skipped for that snapshot message.
+  This works best with exported JSON fields or an aggregate-level NATS codec.
+- **Explicit snapshots:** aggregates implement `Snapshottable` and return a
+  domain snapshot event from `TakeSnapshot`. `EventTypes` returns that snapshot
+  prototype as its second return value, and `Apply` should restore state
+  idempotently from it.
+
+```go
+type OrderSnapshot struct {
+	event.SnapshotEventBase
+
+	OrderID string `json:"order_id"`
+	Created bool   `json:"created"`
+}
+
+func (*Order) EventTypes() ([]event.Event, event.SnapshotEvent) {
+	return []event.Event{&OrderCreatedEvent{}}, &OrderSnapshot{}
+}
+
+func (o *Order) TakeSnapshot() (event.SnapshotEvent, error) {
+	return &OrderSnapshot{OrderID: o.OrderID, Created: o.Created}, nil
+}
+```
+
+Embed `event.SnapshotEventBase` to use the default `snapshot` event name, or
+override `EventName` on the snapshot type to choose a different final subject
+token.
 
 ## Stream Creation
 

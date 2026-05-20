@@ -73,8 +73,8 @@ type accountAggregate struct {
 func (a *accountAggregate) AggregateScope() string { return "billing" }
 func (a *accountAggregate) AggregateType() string  { return "account" }
 func (a *accountAggregate) AggregateID() string    { return a.ID }
-func (a *accountAggregate) EventTypes() []Event {
-	return []Event{&accountCreated{}}
+func (a *accountAggregate) EventTypes() ([]Event, SnapshotEvent) {
+	return []Event{&accountCreated{}}, nil
 }
 func (a *accountAggregate) Apply(evt Event) {
 	switch e := evt.(type) {

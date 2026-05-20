@@ -16,6 +16,18 @@ type Event interface {
 	EventName() string
 }
 
+const DefaultSnapshotEventName = "snapshot"
+
+type SnapshotEvent interface {
+	Event
+	SnapshotEvent()
+}
+
+type SnapshotEventBase struct{}
+
+func (SnapshotEventBase) EventName() string { return DefaultSnapshotEventName }
+func (SnapshotEventBase) SnapshotEvent()    {}
+
 // Command describes an action requested against one aggregate instance.
 type Command interface {
 	AggregateRef
@@ -38,8 +50,14 @@ type MessageKindOverride interface {
 // ESAggregate is an event-sourced entity that can rebuild its state from events.
 type ESAggregate interface {
 	AggregateRef
-	EventTypes() []Event
+	EventTypes() ([]Event, SnapshotEvent)
 	Apply(Event)
+}
+
+// Snapshottable aggregates can provide an explicit snapshot event.
+type Snapshottable interface {
+	ESAggregate
+	TakeSnapshot() (SnapshotEvent, error)
 }
 
 // Store appends and loads aggregate event streams.
