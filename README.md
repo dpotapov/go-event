@@ -257,9 +257,9 @@ snapshot uses the normal event kind and defaults to this subject:
 ```
 
 Enable automatic snapshot writes with `EventStoreConfig.SnapshotEvery`. When the
-latest event sequence is at least `SnapshotEvery` ahead of the latest snapshot
-sequence, the store writes a new snapshot after a successful save. Snapshot write
-failures are logged because the domain events were already committed.
+number of aggregate events since the latest snapshot reaches `SnapshotEvery`,
+the store writes a new snapshot after a successful save. Snapshot write failures
+are logged because the domain events were already committed.
 
 On load, the store reads the latest snapshot with JetStream direct get-last and
 then replays only events after that snapshot sequence. `SnapshotEvery` only

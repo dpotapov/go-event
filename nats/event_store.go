@@ -71,7 +71,7 @@ func (s *EventStore) Save(ctx context.Context, agg event.AggregateRef, expectedV
 		return err
 	}
 	eventsToPublish := events
-	snapshot, err := s.snapshotForSave(ctx, agg, expectedVersion, events)
+	snapshot, err := s.snapshotForSave(ctx, agg, events)
 	if err != nil {
 		return err
 	}
@@ -286,7 +286,9 @@ func (s *EventStore) applyMessage(
 	return nil
 }
 
-func (s *EventStore) snapshotForSave(ctx context.Context, agg event.AggregateRef, expectedVersion uint64, events []event.Event) (event.Event, error) {
+// snapshotForSave uses filtered consumer metadata to count aggregate messages
+// since the latest snapshot. Stream sequence gaps may include other aggregates.
+func (s *EventStore) snapshotForSave(ctx context.Context, agg event.AggregateRef, events []event.Event) (event.Event, error) {
 	if s.snapshotEvery == 0 {
 		return nil, nil
 	}
@@ -303,14 +305,38 @@ func (s *EventStore) snapshotForSave(ctx context.Context, agg event.AggregateRef
 	if err != nil {
 		return nil, fmt.Errorf("get latest snapshot: %w", err)
 	}
-	nextVersion := expectedVersion + uint64(len(events))
-	if lastSnapshotVersion != 0 && nextVersion-lastSnapshotVersion < s.snapshotEvery {
+	eventsSinceSnapshot, err := s.eventsSinceSnapshot(ctx, stream, snapshotAgg, lastSnapshotVersion)
+	if err != nil {
+		return nil, fmt.Errorf("count events since snapshot: %w", err)
+	}
+	if eventsSinceSnapshot+uint64(len(events)) < s.snapshotEvery {
 		return nil, nil
 	}
 	for _, evt := range events {
 		snapshotAgg.Apply(evt)
 	}
 	return s.buildSnapshotEvent(snapshotAgg)
+}
+
+func (s *EventStore) eventsSinceSnapshot(ctx context.Context, stream jetstream.Stream, agg event.ESAggregate, lastSnapshotVersion uint64) (uint64, error) {
+	startSeq := lastSnapshotVersion + 1
+	if startSeq == 0 {
+		startSeq = 1
+	}
+	consumer, err := stream.OrderedConsumer(ctx, jetstream.OrderedConsumerConfig{
+		FilterSubjects:    []string{AggregateMessageFilter(agg.AggregateScope(), agg.AggregateType(), agg.AggregateID())},
+		DeliverPolicy:     jetstream.DeliverByStartSequencePolicy,
+		OptStartSeq:       startSeq,
+		InactiveThreshold: 5 * time.Second,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("create snapshot count consumer: %w", err)
+	}
+	info := consumer.CachedInfo()
+	if info == nil {
+		return 0, nil
+	}
+	return info.NumPending, nil
 }
 
 func (s *EventStore) lastSnapshotVersion(ctx context.Context, stream jetstream.Stream, agg event.ESAggregate) (uint64, error) {

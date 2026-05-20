@@ -259,6 +259,49 @@ func TestEventStoreImplicitSnapshotLoadReplaysTail(t *testing.T) {
 	require.Equal(t, "Fresh", loaded.Name)
 }
 
+func TestEventStoreSnapshotEveryCountsAggregateEventsSinceSnapshot(t *testing.T) {
+	env := natstest.Run(t)
+	env.CreateEventStream(t, "test", "account")
+
+	snapshotOnEverySave, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{SnapshotEvery: 1})
+	require.NoError(t, err)
+	noSnapshotStore, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
+	require.NoError(t, err)
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{SnapshotEvery: 3})
+	require.NoError(t, err)
+
+	agg := &account{ID: "acct-1"}
+	require.NoError(t, snapshotOnEverySave.Save(t.Context(), agg, 0, &accountCreated{AccountID: "acct-1", Name: "Acme"}))
+
+	stream, err := env.JetStream.Stream(t.Context(), goeventnats.StreamName(goeventnats.DefaultStreamPattern, "test", "account"))
+	require.NoError(t, err)
+	snap, err := stream.GetLastMsgForSubject(t.Context(), "test.event.account.acct-1.snapshot")
+	require.NoError(t, err)
+
+	otherAgg := &account{ID: "acct-2"}
+	require.NoError(t, noSnapshotStore.Save(t.Context(), otherAgg, 0, &accountCreated{AccountID: "acct-2", Name: "Other"}))
+	otherVersion, err := noSnapshotStore.Load(t.Context(), &account{ID: "acct-2"})
+	require.NoError(t, err)
+	require.NoError(t, noSnapshotStore.Save(t.Context(), otherAgg, otherVersion, &accountRenamed{AccountID: "acct-2", Name: "Other Updated"}))
+
+	require.NoError(t, noSnapshotStore.Save(t.Context(), agg, snap.Sequence, &accountRenamed{AccountID: "acct-1", Name: "One"}))
+	version, err := noSnapshotStore.Load(t.Context(), &account{ID: "acct-1"})
+	require.NoError(t, err)
+	require.NoError(t, store.Save(t.Context(), agg, version, &accountRenamed{AccountID: "acct-1", Name: "Two"}))
+
+	latestSnap, err := stream.GetLastMsgForSubject(t.Context(), "test.event.account.acct-1.snapshot")
+	require.NoError(t, err)
+	require.Equal(t, snap.Sequence, latestSnap.Sequence)
+
+	version, err = noSnapshotStore.Load(t.Context(), &account{ID: "acct-1"})
+	require.NoError(t, err)
+	require.NoError(t, store.Save(t.Context(), agg, version, &accountRenamed{AccountID: "acct-1", Name: "Three"}))
+
+	latestSnap, err = stream.GetLastMsgForSubject(t.Context(), "test.event.account.acct-1.snapshot")
+	require.NoError(t, err)
+	require.Greater(t, latestSnap.Sequence, snap.Sequence)
+}
+
 func TestEventStoreExplicitSnapshotLoad(t *testing.T) {
 	env := natstest.Run(t)
 	env.CreateEventStream(t, "test", "account")
