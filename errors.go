@@ -1,6 +1,7 @@
 package event
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -76,4 +77,35 @@ func (e *SubscriptionError) Unwrap() error {
 		return nil
 	}
 	return e.Err
+}
+
+// ResponseError represents a structured error received in a CQRS response.
+// It contains the raw JSON payload which can be interpreted by higher layers.
+type ResponseError json.RawMessage
+
+// Error implements the error interface.
+func (e ResponseError) Error() string {
+	var obj struct {
+		Detail  string `json:"detail"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(e, &obj) == nil {
+		if obj.Detail != "" {
+			return obj.Detail
+		}
+		if obj.Message != "" {
+			return obj.Message
+		}
+	}
+	return "operation failed"
+}
+
+// MarshalJSON implements json.Marshaler, allowing the error to be re-serialized.
+func (e ResponseError) MarshalJSON() ([]byte, error) {
+	return e, nil
+}
+
+// UnmarshalInto allows callers to extract the underlying JSON into a typed struct.
+func (e ResponseError) UnmarshalInto(v any) error {
+	return json.Unmarshal(e, v)
 }

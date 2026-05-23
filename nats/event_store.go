@@ -26,14 +26,18 @@ type EventStoreConfig struct {
 	StreamPattern string
 	Logger        *slog.Logger
 	SnapshotEvery uint64
+	// LoadConsumerName optionally returns a deterministic JetStream consumer name
+	// for aggregate loads so JWT permissions can scope consumer lifecycle.
+	LoadConsumerName func(event.AggregateRef) string
 }
 
 type EventStore struct {
-	nc            *gonats.Conn
-	js            jetstream.JetStream
-	streamPattern string
-	snapshotEvery uint64
-	logger        *slog.Logger
+	nc               *gonats.Conn
+	js               jetstream.JetStream
+	streamPattern    string
+	snapshotEvery    uint64
+	loadConsumerName func(event.AggregateRef) string
+	logger           *slog.Logger
 }
 
 var _ event.Store = (*EventStore)(nil)
@@ -55,11 +59,12 @@ func NewEventStore(nc *gonats.Conn, cfg EventStoreConfig) (*EventStore, error) {
 		pattern = DefaultStreamPattern
 	}
 	return &EventStore{
-		nc:            nc,
-		js:            js,
-		streamPattern: pattern,
-		snapshotEvery: cfg.SnapshotEvery,
-		logger:        logger,
+		nc:               nc,
+		js:               js,
+		streamPattern:    pattern,
+		snapshotEvery:    cfg.SnapshotEvery,
+		loadConsumerName: cfg.LoadConsumerName,
+		logger:           logger,
 	}, nil
 }
 
@@ -112,6 +117,18 @@ func (s *EventStore) Load(ctx context.Context, agg event.ESAggregate) (uint64, e
 	} else if !errors.Is(err, jetstream.ErrMsgNotFound) {
 		return 0, fmt.Errorf("get latest snapshot: %w", err)
 	}
+	if s.loadConsumerName != nil {
+		if consumerName := s.loadConsumerName(agg); consumerName != "" {
+			version, err := s.loadWithNamedConsumer(ctx, stream, streamName, filter, registry, agg, startSeq, snapshotSuffix, snapshottable, consumerName)
+			if err != nil {
+				return 0, err
+			}
+			if version == 0 && startSeq > 0 {
+				return startSeq - 1, nil
+			}
+			return version, nil
+		}
+	}
 	version, err := s.loadFrom(ctx, stream, filter, registry, agg, startSeq, snapshotSuffix, snapshottable)
 	if err != nil {
 		return 0, err
@@ -120,6 +137,131 @@ func (s *EventStore) Load(ctx context.Context, agg event.ESAggregate) (uint64, e
 		return startSeq - 1, nil
 	}
 	return version, nil
+}
+
+func (s *EventStore) loadWithNamedConsumer(
+	ctx context.Context,
+	stream jetstream.Stream,
+	streamName string,
+	filter string,
+	registry event.DecoderRegistry,
+	agg event.ESAggregate,
+	startSeq uint64,
+	snapshotSuffix string,
+	snapshottable bool,
+	consumerName string,
+) (uint64, error) {
+	if err := s.deleteNamedConsumer(ctx, streamName, consumerName); err != nil {
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("delete stale named consumer %q: %w", consumerName, err)
+	}
+
+	consumerCfg := jetstream.ConsumerConfig{
+		Name:              consumerName,
+		Durable:           consumerName,
+		FilterSubject:     filter,
+		AckPolicy:         jetstream.AckNonePolicy,
+		ReplayPolicy:      jetstream.ReplayInstantPolicy,
+		InactiveThreshold: 5 * time.Second,
+	}
+	if startSeq > 0 {
+		consumerCfg.DeliverPolicy = jetstream.DeliverByStartSequencePolicy
+		consumerCfg.OptStartSeq = startSeq
+	} else {
+		consumerCfg.DeliverPolicy = jetstream.DeliverAllPolicy
+	}
+
+	cons, err := stream.CreateOrUpdateConsumer(ctx, consumerCfg)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("create named consumer %q: %w", consumerName, err)
+	}
+
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if derr := s.deleteNamedConsumer(cleanupCtx, streamName, consumerName); derr != nil && !errors.Is(derr, jetstream.ErrStreamNotFound) {
+			s.logger.WarnContext(ctx, "Failed to delete named load consumer",
+				"stream", streamName,
+				"consumer", consumerName,
+				"err", derr,
+			)
+		}
+	}()
+
+	return s.loadFromConsumer(ctx, cons, registry, agg, snapshotSuffix, snapshottable)
+}
+
+func (s *EventStore) loadFromConsumer(
+	ctx context.Context,
+	consumer jetstream.Consumer,
+	registry event.DecoderRegistry,
+	agg event.ESAggregate,
+	snapshotSuffix string,
+	snapshottable bool,
+) (uint64, error) {
+	info := consumer.CachedInfo()
+	if info == nil || info.NumPending == 0 {
+		return 0, nil
+	}
+	iter, err := consumer.Messages()
+	if err != nil {
+		return 0, fmt.Errorf("open event iterator: %w", err)
+	}
+	defer iter.Stop()
+
+	var version uint64
+	for {
+		msg, err := iter.Next()
+		if err != nil {
+			return 0, fmt.Errorf("read event: %w", err)
+		}
+		meta, err := msg.Metadata()
+		if err != nil {
+			return 0, fmt.Errorf("read event metadata: %w", err)
+		}
+		version = meta.Sequence.Stream
+		if err := s.applyMessage(registry, msg.Subject(), msg.Data(), meta.Timestamp, agg, snapshotSuffix, snapshottable); err != nil {
+			return 0, err
+		}
+		if meta.NumPending == 0 {
+			return version, nil
+		}
+	}
+}
+
+func (s *EventStore) deleteNamedConsumer(ctx context.Context, streamName, consumerName string) error {
+	const maxAttempts = 10
+	delay := 10 * time.Millisecond
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err := s.js.DeleteConsumer(ctx, streamName, consumerName)
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, jetstream.ErrConsumerNotFound):
+			return nil
+		case errors.Is(err, jetstream.ErrStreamNotFound):
+			return err
+		}
+		if ctx.Err() != nil || attempt == maxAttempts-1 {
+			return err
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return err
+		case <-timer.C:
+		}
+		if delay < 200*time.Millisecond {
+			delay *= 2
+		}
+	}
+	return nil
 }
 
 func (s *EventStore) loadFrom(

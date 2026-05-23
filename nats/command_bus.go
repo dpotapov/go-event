@@ -68,6 +68,9 @@ func (d *Dispatcher) request(ctx context.Context, subject string, data []byte, r
 		return fmt.Errorf("decode response: %w", err)
 	}
 	if !envelope.OK {
+		if len(envelope.Data) > 0 {
+			return goevent.ResponseError(envelope.Data)
+		}
 		if envelope.Error == "" {
 			return errors.New("handler failed")
 		}
@@ -184,7 +187,7 @@ func (s *CommandSubscriber) handle(ctx context.Context, kind goevent.MessageKind
 	if commandHandler != nil {
 		err = commandHandler.HandleCommand(ctx, cmd)
 		if err != nil {
-			_ = respond(msg, responseEnvelope{OK: false, Error: err.Error()})
+			respondHandlerError(msg, err)
 			return
 		}
 		_ = respond(msg, responseEnvelope{OK: true})
@@ -192,7 +195,7 @@ func (s *CommandSubscriber) handle(ctx context.Context, kind goevent.MessageKind
 	}
 	result, err := queryHandler.HandleQuery(ctx, cmd)
 	if err != nil {
-		_ = respond(msg, responseEnvelope{OK: false, Error: err.Error()})
+		respondHandlerError(msg, err)
 		return
 	}
 	data, err := json.Marshal(result)
@@ -201,6 +204,16 @@ func (s *CommandSubscriber) handle(ctx context.Context, kind goevent.MessageKind
 		return
 	}
 	_ = respond(msg, responseEnvelope{OK: true, Data: data})
+}
+
+func respondHandlerError(msg *gonats.Msg, err error) {
+	if marshaler, ok := err.(json.Marshaler); ok {
+		if data, marshalErr := json.Marshal(marshaler); marshalErr == nil {
+			_ = respond(msg, responseEnvelope{OK: false, Data: data})
+			return
+		}
+	}
+	_ = respond(msg, responseEnvelope{OK: false, Error: err.Error()})
 }
 
 type responseEnvelope struct {
