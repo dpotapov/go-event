@@ -533,6 +533,159 @@ func TestNATSBusQueueHandlerSupportsCustomEventKind(t *testing.T) {
 	require.Equal(t, "started", receive(t, seen))
 }
 
+func TestEventStoreStreamYieldsDomainEventsOldestFirst(t *testing.T) {
+	env := natstest.Run(t)
+	env.CreateEventStream(t, "test", "account")
+
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
+	require.NoError(t, err)
+
+	agg := &account{ID: "acct-1"}
+	require.NoError(t, store.Save(t.Context(), agg, 0, &accountCreated{AccountID: "acct-1", Name: "One"}))
+	version, err := store.Load(t.Context(), &account{ID: "acct-1"})
+	require.NoError(t, err)
+	require.NoError(t, store.Save(t.Context(), agg, version, &accountRenamed{AccountID: "acct-1", Name: "Two"}))
+	version, err = store.Load(t.Context(), &account{ID: "acct-1"})
+	require.NoError(t, err)
+	require.NoError(t, store.Save(t.Context(), agg, version, &accountRenamed{AccountID: "acct-1", Name: "Three"}))
+
+	var got []event.StoredEvent
+	for rec, err := range store.Stream(t.Context(), &account{ID: "acct-1"}, event.ReadOptions{}) {
+		require.NoError(t, err)
+		got = append(got, rec)
+	}
+	require.Len(t, got, 3)
+	require.Equal(t, "created", got[0].Event.EventName())
+	require.Equal(t, "renamed", got[1].Event.EventName())
+	require.Equal(t, "renamed", got[2].Event.EventName())
+	require.True(t, got[0].Version < got[1].Version)
+	require.True(t, got[1].Version < got[2].Version)
+	require.False(t, got[0].Timestamp.IsZero())
+}
+
+func TestEventStoreStreamSkipsSnapshotsByDefault(t *testing.T) {
+	env := natstest.Run(t)
+	env.CreateEventStream(t, "test", "account")
+
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{SnapshotEvery: 1})
+	require.NoError(t, err)
+
+	agg := &snapshottedAccount{ID: "acct-1"}
+	require.NoError(t, store.Save(t.Context(), agg, 0, &accountCreated{AccountID: "acct-1", Name: "Acme"}))
+
+	var withoutSnapshot []event.StoredEvent
+	for rec, err := range store.Stream(t.Context(), &snapshottedAccount{ID: "acct-1"}, event.ReadOptions{}) {
+		require.NoError(t, err)
+		withoutSnapshot = append(withoutSnapshot, rec)
+	}
+	require.Empty(t, withoutSnapshot)
+
+	var withSnapshot []event.StoredEvent
+	for rec, err := range store.Stream(t.Context(), &snapshottedAccount{ID: "acct-1"}, event.ReadOptions{IncludeSnapshots: true}) {
+		require.NoError(t, err)
+		withSnapshot = append(withSnapshot, rec)
+	}
+	require.Len(t, withSnapshot, 1)
+	require.Equal(t, event.DefaultSnapshotEventName, withSnapshot[0].Event.EventName())
+}
+
+func TestEventStoreStreamMatchesLoadReplayWindow(t *testing.T) {
+	env := natstest.Run(t)
+	env.CreateEventStream(t, "test", "account")
+
+	snapshotStore, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{SnapshotEvery: 1})
+	require.NoError(t, err)
+	noSnapshotStore, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
+	require.NoError(t, err)
+
+	agg := &snapshottedAccount{ID: "acct-1"}
+	require.NoError(t, snapshotStore.Save(t.Context(), agg, 0, &accountCreated{AccountID: "acct-1", Name: "Acme"}))
+
+	stream, err := env.JetStream.Stream(t.Context(), goeventnats.StreamName(goeventnats.DefaultStreamPattern, "test", "account"))
+	require.NoError(t, err)
+	snap, err := stream.GetLastMsgForSubject(t.Context(), "test.event.account.acct-1.snapshot")
+	require.NoError(t, err)
+	require.NoError(t, noSnapshotStore.Save(t.Context(), agg, snap.Sequence, &accountRenamed{AccountID: "acct-1", Name: "Fresh"}))
+
+	var streamed []event.StoredEvent
+	for rec, err := range snapshotStore.Stream(t.Context(), &snapshottedAccount{ID: "acct-1"}, event.ReadOptions{}) {
+		require.NoError(t, err)
+		streamed = append(streamed, rec)
+	}
+	require.Len(t, streamed, 1)
+	renamed, ok := streamed[0].Event.(*accountRenamed)
+	require.True(t, ok)
+	require.Equal(t, "Fresh", renamed.Name)
+
+	loaded := &snapshottedAccount{ID: "acct-1"}
+	version, err := snapshotStore.Load(t.Context(), loaded)
+	require.NoError(t, err)
+	require.Equal(t, "Fresh", loaded.Name)
+	require.Equal(t, streamed[0].Version, version)
+}
+
+func TestEventStoreStreamEmptyStream(t *testing.T) {
+	env := natstest.Run(t)
+
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
+	require.NoError(t, err)
+
+	var count int
+	for _, err := range store.Stream(t.Context(), &account{ID: "missing"}, event.ReadOptions{}) {
+		require.NoError(t, err)
+		count++
+	}
+	require.Zero(t, count)
+}
+
+func TestEventStoreStreamPropagatesDecodeError(t *testing.T) {
+	env := natstest.Run(t)
+	env.CreateEventStream(t, "test", "account")
+
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
+	require.NoError(t, err)
+
+	agg := &account{ID: "acct-1"}
+	require.NoError(t, store.Save(t.Context(), agg, 0, &accountCreated{AccountID: "acct-1", Name: "Acme"}))
+
+	_, err = env.JetStream.Publish(t.Context(), "test.event.account.acct-1.renamed", []byte("{not-json"))
+	require.NoError(t, err)
+
+	var gotErr error
+	var count int
+	for _, err := range store.Stream(t.Context(), &account{ID: "acct-1"}, event.ReadOptions{}) {
+		if err != nil {
+			gotErr = err
+			break
+		}
+		count++
+	}
+	require.Equal(t, 1, count)
+	require.Error(t, gotErr)
+}
+
+func TestEventStoreCollectAndFindFirst(t *testing.T) {
+	env := natstest.Run(t)
+	env.CreateEventStream(t, "test", "account")
+
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
+	require.NoError(t, err)
+
+	agg := &account{ID: "acct-1"}
+	require.NoError(t, store.Save(t.Context(), agg, 0, &accountCreated{AccountID: "acct-1", Name: "Acme"}))
+
+	all, err := event.Collect(t.Context(), store, &account{ID: "acct-1"}, event.ReadOptions{})
+	require.NoError(t, err)
+	require.Len(t, all, 1)
+
+	rec, ok, err := event.FindFirst(t.Context(), store, &account{ID: "acct-1"}, event.ReadOptions{}, func(evt event.Event) bool {
+		return evt.EventName() == "created"
+	})
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "created", rec.Event.EventName())
+}
+
 func BenchmarkRawJetStreamSubscription(b *testing.B) {
 	env := natstest.Run(b)
 	env.CreateEventStream(b, "test", "account")

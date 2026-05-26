@@ -92,34 +92,27 @@ func (s *EventStore) Save(ctx context.Context, agg event.AggregateRef, expectedV
 }
 
 func (s *EventStore) Load(ctx context.Context, agg event.ESAggregate) (uint64, error) {
-	registry, err := eventRegistryFor(agg)
+	read, err := s.resolveReadContext(ctx, agg)
+	if errors.Is(err, errStreamNotFound) {
+		return 0, nil
+	}
 	if err != nil {
 		return 0, err
 	}
-	streamName := s.streamFor(agg.AggregateScope(), agg.AggregateType())
-	filter := AggregateMessageFilter(agg.AggregateScope(), agg.AggregateType(), agg.AggregateID())
-	_, snapshotType := agg.EventTypes()
-	snapshotSuffix := "." + snapshotEventName(snapshotType)
-	_, snapshottable := agg.(event.Snapshottable)
-	stream, err := s.js.Stream(ctx, streamName)
+
+	applySnapshot := func(subject string, data []byte, timestamp time.Time) error {
+		return s.applyMessage(read.registry, subject, data, timestamp, agg, read.snapshotSuffix, read.snapshottable)
+	}
+	startSeq, _, err := startSeqAfterSnapshot(ctx, read.stream, agg, event.ReadOptions{}, applySnapshot)
 	if err != nil {
-		if errors.Is(err, jetstream.ErrStreamNotFound) {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("get stream %s: %w", streamName, err)
+		return 0, err
 	}
-	startSeq := uint64(0)
-	if msg, err := stream.GetLastMsgForSubject(ctx, SnapshotSubject(agg)); err == nil {
-		if err := s.applyMessage(registry, msg.Subject, msg.Data, msg.Time, agg, snapshotSuffix, snapshottable); err != nil {
-			return 0, err
-		}
-		startSeq = msg.Sequence + 1
-	} else if !errors.Is(err, jetstream.ErrMsgNotFound) {
-		return 0, fmt.Errorf("get latest snapshot: %w", err)
-	}
+
+	var version uint64
 	if s.loadConsumerName != nil {
 		if consumerName := s.loadConsumerName(agg); consumerName != "" {
-			version, err := s.loadWithNamedConsumer(ctx, stream, streamName, filter, registry, agg, startSeq, snapshotSuffix, snapshottable, consumerName)
+			streamName := s.streamFor(agg.AggregateScope(), agg.AggregateType())
+			version, err = s.loadWithNamedConsumer(ctx, read, agg, startSeq, consumerName, streamName)
 			if err != nil {
 				return 0, err
 			}
@@ -129,7 +122,15 @@ func (s *EventStore) Load(ctx context.Context, agg event.ESAggregate) (uint64, e
 			return version, nil
 		}
 	}
-	version, err := s.loadFrom(ctx, stream, filter, registry, agg, startSeq, snapshotSuffix, snapshottable)
+
+	consumer, err := openAggregateConsumer(ctx, read.stream, read.filter, startSeq)
+	if err != nil {
+		return 0, err
+	}
+
+	version, err = s.forEachAggregateMessage(ctx, consumer, func(subject string, data []byte, timestamp time.Time, seq uint64) error {
+		return s.applyMessage(read.registry, subject, data, timestamp, agg, read.snapshotSuffix, read.snapshottable)
+	})
 	if err != nil {
 		return 0, err
 	}
@@ -141,15 +142,11 @@ func (s *EventStore) Load(ctx context.Context, agg event.ESAggregate) (uint64, e
 
 func (s *EventStore) loadWithNamedConsumer(
 	ctx context.Context,
-	stream jetstream.Stream,
-	streamName string,
-	filter string,
-	registry event.DecoderRegistry,
+	read aggregateReadContext,
 	agg event.ESAggregate,
 	startSeq uint64,
-	snapshotSuffix string,
-	snapshottable bool,
 	consumerName string,
+	streamName string,
 ) (uint64, error) {
 	if err := s.deleteNamedConsumer(ctx, streamName, consumerName); err != nil {
 		if errors.Is(err, jetstream.ErrStreamNotFound) {
@@ -161,10 +158,10 @@ func (s *EventStore) loadWithNamedConsumer(
 	consumerCfg := jetstream.ConsumerConfig{
 		Name:              consumerName,
 		Durable:           consumerName,
-		FilterSubject:     filter,
+		FilterSubject:     read.filter,
 		AckPolicy:         jetstream.AckNonePolicy,
 		ReplayPolicy:      jetstream.ReplayInstantPolicy,
-		InactiveThreshold: 5 * time.Second,
+		InactiveThreshold: aggregateConsumerInactiveThreshold,
 	}
 	if startSeq > 0 {
 		consumerCfg.DeliverPolicy = jetstream.DeliverByStartSequencePolicy
@@ -173,7 +170,7 @@ func (s *EventStore) loadWithNamedConsumer(
 		consumerCfg.DeliverPolicy = jetstream.DeliverAllPolicy
 	}
 
-	cons, err := stream.CreateOrUpdateConsumer(ctx, consumerCfg)
+	cons, err := read.stream.CreateOrUpdateConsumer(ctx, consumerCfg)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrStreamNotFound) {
 			return 0, nil
@@ -193,45 +190,9 @@ func (s *EventStore) loadWithNamedConsumer(
 		}
 	}()
 
-	return s.loadFromConsumer(ctx, cons, registry, agg, snapshotSuffix, snapshottable)
-}
-
-func (s *EventStore) loadFromConsumer(
-	ctx context.Context,
-	consumer jetstream.Consumer,
-	registry event.DecoderRegistry,
-	agg event.ESAggregate,
-	snapshotSuffix string,
-	snapshottable bool,
-) (uint64, error) {
-	info := consumer.CachedInfo()
-	if info == nil || info.NumPending == 0 {
-		return 0, nil
-	}
-	iter, err := consumer.Messages()
-	if err != nil {
-		return 0, fmt.Errorf("open event iterator: %w", err)
-	}
-	defer iter.Stop()
-
-	var version uint64
-	for {
-		msg, err := iter.Next()
-		if err != nil {
-			return 0, fmt.Errorf("read event: %w", err)
-		}
-		meta, err := msg.Metadata()
-		if err != nil {
-			return 0, fmt.Errorf("read event metadata: %w", err)
-		}
-		version = meta.Sequence.Stream
-		if err := s.applyMessage(registry, msg.Subject(), msg.Data(), meta.Timestamp, agg, snapshotSuffix, snapshottable); err != nil {
-			return 0, err
-		}
-		if meta.NumPending == 0 {
-			return version, nil
-		}
-	}
+	return s.forEachAggregateMessage(ctx, cons, func(subject string, data []byte, timestamp time.Time, seq uint64) error {
+		return s.applyMessage(read.registry, subject, data, timestamp, agg, read.snapshotSuffix, read.snapshottable)
+	})
 }
 
 func (s *EventStore) deleteNamedConsumer(ctx context.Context, streamName, consumerName string) error {
@@ -262,59 +223,6 @@ func (s *EventStore) deleteNamedConsumer(ctx context.Context, streamName, consum
 		}
 	}
 	return nil
-}
-
-func (s *EventStore) loadFrom(
-	ctx context.Context,
-	stream jetstream.Stream,
-	filter string,
-	registry event.DecoderRegistry,
-	agg event.ESAggregate,
-	startSeq uint64,
-	snapshotSuffix string,
-	snapshottable bool,
-) (uint64, error) {
-	if startSeq == 0 {
-		startSeq = 1
-	}
-	consumerCfg := jetstream.OrderedConsumerConfig{
-		FilterSubjects:    []string{filter},
-		DeliverPolicy:     jetstream.DeliverByStartSequencePolicy,
-		OptStartSeq:       startSeq,
-		InactiveThreshold: 5 * time.Second,
-	}
-	consumer, err := stream.OrderedConsumer(ctx, consumerCfg)
-	if err != nil {
-		return 0, fmt.Errorf("create load consumer: %w", err)
-	}
-	info := consumer.CachedInfo()
-	if info == nil || info.NumPending == 0 {
-		return 0, nil
-	}
-	iter, err := consumer.Messages()
-	if err != nil {
-		return 0, fmt.Errorf("open event iterator: %w", err)
-	}
-	defer iter.Stop()
-
-	var version uint64
-	for {
-		msg, err := iter.Next()
-		if err != nil {
-			return 0, fmt.Errorf("read event: %w", err)
-		}
-		meta, err := msg.Metadata()
-		if err != nil {
-			return 0, fmt.Errorf("read event metadata: %w", err)
-		}
-		version = meta.Sequence.Stream
-		if err := s.applyMessage(registry, msg.Subject(), msg.Data(), meta.Timestamp, agg, snapshotSuffix, snapshottable); err != nil {
-			return 0, err
-		}
-		if meta.NumPending == 0 {
-			return version, nil
-		}
-	}
 }
 
 func (s *EventStore) publishOne(ctx context.Context, agg event.AggregateRef, expectedVersion uint64, evt event.Event) (uint64, error) {
@@ -469,7 +377,7 @@ func (s *EventStore) eventsSinceSnapshot(ctx context.Context, stream jetstream.S
 		FilterSubjects:    []string{AggregateMessageFilter(agg.AggregateScope(), agg.AggregateType(), agg.AggregateID())},
 		DeliverPolicy:     jetstream.DeliverByStartSequencePolicy,
 		OptStartSeq:       startSeq,
-		InactiveThreshold: 5 * time.Second,
+		InactiveThreshold: aggregateConsumerInactiveThreshold,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("create snapshot count consumer: %w", err)

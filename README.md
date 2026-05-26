@@ -20,6 +20,7 @@ specific role:
   concurrency. For background on event sourcing, see Martin Fowler's
   [Event Sourcing](https://martinfowler.com/eaaDev/EventSourcing.html) and Greg
   Young's [Building an Event Storage](https://cqrs.wordpress.com/documents/building-event-storage/).
+- `Reader` streams decoded aggregate history for audit and read-side inspection.
 - `Bus` lets services communicate by dispatching commands, invoking queries, and
   subscribing to commands, queries, and events. Event subscriptions have two common
   models: an event handler builds local projections from an ordered event stream,
@@ -297,6 +298,42 @@ func (o *Order) TakeSnapshot() (event.SnapshotEvent, error) {
 Embed `event.SnapshotEventBase` to use the default `snapshot` event name, or
 override `EventName` on the snapshot type to choose a different final subject
 token.
+
+## Reading Aggregate History
+
+Use `Store.Load` when you need to rebuild aggregate state for command handling.
+Use `Reader.Stream` when you need decoded events for audit, debug, or read-side
+inspection without mutating an aggregate.
+
+The NATS event store implements both `event.Store` and `event.Reader`:
+
+```go
+for rec, err := range store.Stream(ctx, &Order{OrderID: id}, event.ReadOptions{}) {
+	if err != nil {
+		return fmt.Errorf("stream order history: %w", err)
+	}
+	// rec.Event, rec.Version, rec.Timestamp
+}
+```
+
+`ReadOptions` controls replay:
+
+- `SkipSnapshotFastPath` — when false (default), streaming starts after the
+  latest snapshot, matching the replay window `Load` uses.
+- `IncludeSnapshots` — when false (default), snapshot subject messages are
+  omitted. Set true to include explicit snapshot events.
+
+Helpers:
+
+```go
+events, err := event.Collect(ctx, store, agg, event.ReadOptions{})
+rec, ok, err := event.FindFirst(ctx, store, agg, event.ReadOptions{}, func(evt event.Event) bool {
+	return evt.EventName() == "created"
+})
+```
+
+The read path uses an ephemeral JetStream ordered consumer filtered to one
+aggregate. It does not create durable load consumers.
 
 ## Stream Creation
 
