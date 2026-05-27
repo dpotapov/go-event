@@ -15,7 +15,7 @@ type stubReader struct {
 	err    error
 }
 
-func (s stubReader) Stream(_ context.Context, _ event.ESAggregate, _ event.ReadOptions) iter.Seq2[event.StoredEvent, error] {
+func (s stubReader) Stream(_ context.Context, _ event.AggregateRef, _ event.ReadOptions) iter.Seq2[event.StoredEvent, error] {
 	return func(yield func(event.StoredEvent, error) bool) {
 		for _, rec := range s.events {
 			if !yield(rec, nil) {
@@ -34,6 +34,30 @@ type stubEvent struct {
 }
 
 func (e stubEvent) EventName() string { return e.name }
+
+func TestAggregateKey(t *testing.T) {
+	ref := event.AggregateKey{Scope: "billing", Type: "account", ID: "acct-1"}
+
+	require.Equal(t, "billing", ref.AggregateScope())
+	require.Equal(t, "account", ref.AggregateType())
+	require.Equal(t, "acct-1", ref.AggregateID())
+}
+
+func TestGenericEvent(t *testing.T) {
+	subj := event.Subject{
+		Scope:         "billing",
+		Kind:          event.KindEvent,
+		AggregateType: "account",
+		AggregateID:   "acct-1",
+		Name:          "created",
+	}
+	evt := event.GenericEvent{Subject: subj}
+
+	require.Equal(t, "billing", evt.AggregateScope())
+	require.Equal(t, "account", evt.AggregateType())
+	require.Equal(t, "acct-1", evt.AggregateID())
+	require.Equal(t, "created", evt.EventName())
+}
 
 func TestCollect(t *testing.T) {
 	now := time.Now().UTC()

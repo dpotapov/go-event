@@ -312,16 +312,34 @@ for rec, err := range store.Stream(ctx, &Order{OrderID: id}, event.ReadOptions{}
 	if err != nil {
 		return fmt.Errorf("stream order history: %w", err)
 	}
-	// rec.Event, rec.Version, rec.Timestamp
+	// rec.Event, rec.Subject, rec.Data, rec.Version, rec.Timestamp
+}
+```
+
+When the reference passed to `Stream` also implements `ESAggregate`, events are
+decoded into the concrete types declared by `EventTypes`, matching the load
+replay contract. When the reference is only an `AggregateRef`, the stream yields
+all matching aggregate messages as `event.GenericEvent` values and leaves the
+stored payload in `StoredEvent.Data` as opaque bytes:
+
+```go
+ref := event.AggregateKey{Scope: "sales", Type: "order", ID: string(id)}
+for rec, err := range store.Stream(ctx, ref, event.ReadOptions{}) {
+	if err != nil {
+		return fmt.Errorf("stream raw order history: %w", err)
+	}
+	// rec.Event.EventName() names the event; rec.Data contains transport bytes.
 }
 ```
 
 `ReadOptions` controls replay:
 
 - `SkipSnapshotFastPath` — when false (default), streaming starts after the
-  latest snapshot, matching the replay window `Load` uses.
+  latest snapshot for event-sourced aggregates, matching the replay window
+  `Load` uses.
 - `IncludeSnapshots` — when false (default), snapshot subject messages are
-  omitted. Set true to include explicit snapshot events.
+  omitted for event-sourced aggregates. Set true to include explicit snapshot
+  events.
 
 Helpers:
 

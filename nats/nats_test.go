@@ -788,6 +788,14 @@ func TestEventStoreStreamYieldsDomainEventsOldestFirst(t *testing.T) {
 	require.Equal(t, "created", got[0].Event.EventName())
 	require.Equal(t, "renamed", got[1].Event.EventName())
 	require.Equal(t, "renamed", got[2].Event.EventName())
+	require.Equal(t, event.Subject{
+		Scope:         "test",
+		Kind:          event.KindEvent,
+		AggregateType: "account",
+		AggregateID:   "acct-1",
+		Name:          "created",
+	}, got[0].Subject)
+	require.JSONEq(t, `{"account_id":"acct-1","name":"One"}`, string(got[0].Data))
 	require.True(t, got[0].Version < got[1].Version)
 	require.True(t, got[1].Version < got[2].Version)
 	require.False(t, got[0].Timestamp.IsZero())
@@ -809,6 +817,52 @@ func TestEventStoreCollectSkipsUnregisteredEventTypes(t *testing.T) {
 	require.Len(t, got, 1)
 	require.Equal(t, "created", got[0].Event.EventName())
 	require.Equal(t, uint64(1), got[0].Version)
+}
+
+func TestEventStoreStreamGenericAggregateRefYieldsAllEvents(t *testing.T) {
+	env := natstest.Run(t)
+	env.CreateEventStream(t, "test", "account")
+
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
+	require.NoError(t, err)
+
+	agg := &account{ID: "acct-1"}
+	require.NoError(t, store.Save(t.Context(), agg, 0, &accountCreated{AccountID: "acct-1", Name: "Acme"}))
+	_, err = env.JetStream.Publish(t.Context(), "test.event.account.acct-1.unregistered", []byte{0x00, 0x01, 0x02})
+	require.NoError(t, err)
+
+	ref := event.AggregateKey{Scope: "test", Type: "account", ID: "acct-1"}
+	var got []event.StoredEvent
+	for rec, err := range store.Stream(t.Context(), ref, event.ReadOptions{}) {
+		require.NoError(t, err)
+		got = append(got, rec)
+	}
+
+	require.Len(t, got, 2)
+	require.Equal(t, "created", got[0].Event.EventName())
+	require.Equal(t, event.Subject{
+		Scope:         "test",
+		Kind:          event.KindEvent,
+		AggregateType: "account",
+		AggregateID:   "acct-1",
+		Name:          "created",
+	}, got[0].Subject)
+	require.JSONEq(t, `{"account_id":"acct-1","name":"Acme"}`, string(got[0].Data))
+	require.NotZero(t, got[0].Version)
+	require.False(t, got[0].Timestamp.IsZero())
+
+	generic, ok := got[1].Event.(event.GenericEvent)
+	require.True(t, ok)
+	require.Equal(t, "unregistered", generic.EventName())
+	require.Equal(t, event.Subject{
+		Scope:         "test",
+		Kind:          event.KindEvent,
+		AggregateType: "account",
+		AggregateID:   "acct-1",
+		Name:          "unregistered",
+	}, got[1].Subject)
+	require.Equal(t, []byte{0x00, 0x01, 0x02}, got[1].Data)
+	require.True(t, got[0].Version < got[1].Version)
 }
 
 func TestEventStoreStreamSkipsSnapshotsByDefault(t *testing.T) {

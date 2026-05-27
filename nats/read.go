@@ -47,6 +47,21 @@ func (s *EventStore) resolveReadContext(ctx context.Context, agg event.ESAggrega
 	}, nil
 }
 
+func (s *EventStore) resolveGenericReadContext(ctx context.Context, ref event.AggregateRef) (aggregateReadContext, error) {
+	streamName := s.streamFor(ref.AggregateScope(), ref.AggregateType())
+	stream, err := s.js.Stream(ctx, streamName)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			return aggregateReadContext{}, errStreamNotFound
+		}
+		return aggregateReadContext{}, fmt.Errorf("get stream %s: %w", streamName, err)
+	}
+	return aggregateReadContext{
+		stream: stream,
+		filter: AggregateMessageFilter(ref.AggregateScope(), ref.AggregateType(), ref.AggregateID()),
+	}, nil
+}
+
 var errStreamNotFound = errors.New("event stream not found")
 
 func startSeqAfterSnapshot(
@@ -152,6 +167,10 @@ func (s *EventStore) storedEventFromMessage(
 	if isSnapshot && !snapshottable {
 		return event.StoredEvent{}, false, nil
 	}
+	subj, ok := ParseSubject(subject)
+	if !ok {
+		return event.StoredEvent{}, false, fmt.Errorf("invalid event subject %q", subject)
+	}
 	evt, err := s.decodeEvent(registry, subject, data, timestamp)
 	if err != nil {
 		if !isSnapshot && isUnknownEventError(err) {
@@ -161,9 +180,25 @@ func (s *EventStore) storedEventFromMessage(
 	}
 	return event.StoredEvent{
 		Event:     evt,
+		Subject:   subj,
+		Data:      append([]byte(nil), data...),
 		Version:   version,
 		Timestamp: timestamp,
 	}, true, nil
+}
+
+func genericStoredEventFromMessage(subject string, data []byte, timestamp time.Time, version uint64) (event.StoredEvent, error) {
+	subj, ok := ParseSubject(subject)
+	if !ok {
+		return event.StoredEvent{}, fmt.Errorf("invalid event subject %q", subject)
+	}
+	return event.StoredEvent{
+		Event:     event.GenericEvent{Subject: subj},
+		Subject:   subj,
+		Data:      append([]byte(nil), data...),
+		Version:   version,
+		Timestamp: timestamp,
+	}, nil
 }
 
 func storedEventFromRawSnapshot(
@@ -192,69 +227,112 @@ func storedEventFromRawSnapshot(
 
 var _ event.Reader = (*EventStore)(nil)
 
-// Stream yields decoded aggregate events oldest first.
-func (s *EventStore) Stream(ctx context.Context, agg event.ESAggregate, opts event.ReadOptions) iter.Seq2[event.StoredEvent, error] {
+// Stream yields aggregate events oldest first.
+func (s *EventStore) Stream(ctx context.Context, ref event.AggregateRef, opts event.ReadOptions) iter.Seq2[event.StoredEvent, error] {
 	return func(yield func(event.StoredEvent, error) bool) {
-		read, err := s.resolveReadContext(ctx, agg)
-		if errors.Is(err, errStreamNotFound) {
+		agg, ok := ref.(event.ESAggregate)
+		if !ok {
+			s.streamGeneric(ctx, ref, yield)
 			return
 		}
+		s.streamTyped(ctx, agg, opts, yield)
+	}
+}
+
+func (s *EventStore) streamTyped(ctx context.Context, agg event.ESAggregate, opts event.ReadOptions, yield func(event.StoredEvent, error) bool) {
+	read, err := s.resolveReadContext(ctx, agg)
+	if errors.Is(err, errStreamNotFound) {
+		return
+	}
+	if err != nil {
+		yield(event.StoredEvent{}, err)
+		return
+	}
+
+	startSeq, snapshotMsg, err := startSeqAfterSnapshot(ctx, read.stream, agg, opts, nil)
+	if err != nil {
+		yield(event.StoredEvent{}, err)
+		return
+	}
+
+	if snapshotMsg != nil {
+		rec, err := storedEventFromRawSnapshot(s, read, snapshotMsg)
 		if err != nil {
 			yield(event.StoredEvent{}, err)
 			return
 		}
-
-		startSeq, snapshotMsg, err := startSeqAfterSnapshot(ctx, read.stream, agg, opts, nil)
-		if err != nil {
-			yield(event.StoredEvent{}, err)
+		if !yield(rec, nil) {
 			return
 		}
+	}
 
-		if snapshotMsg != nil {
-			rec, err := storedEventFromRawSnapshot(s, read, snapshotMsg)
-			if err != nil {
-				yield(event.StoredEvent{}, err)
-				return
-			}
-			if !yield(rec, nil) {
-				return
-			}
-		}
+	consumer, err := openAggregateConsumer(ctx, read.stream, read.filter, startSeq)
+	if err != nil {
+		yield(event.StoredEvent{}, err)
+		return
+	}
 
-		consumer, err := openAggregateConsumer(ctx, read.stream, read.filter, startSeq)
+	_, err = s.forEachAggregateMessage(ctx, consumer, func(subject string, data []byte, timestamp time.Time, version uint64) error {
+		rec, ok, err := s.storedEventFromMessage(
+			read.registry,
+			subject,
+			data,
+			timestamp,
+			version,
+			read.snapshotSuffix,
+			read.snapshottable,
+			opts.IncludeSnapshots,
+		)
 		if err != nil {
-			yield(event.StoredEvent{}, err)
-			return
+			return err
 		}
-
-		_, err = s.forEachAggregateMessage(ctx, consumer, func(subject string, data []byte, timestamp time.Time, version uint64) error {
-			rec, ok, err := s.storedEventFromMessage(
-				read.registry,
-				subject,
-				data,
-				timestamp,
-				version,
-				read.snapshotSuffix,
-				read.snapshottable,
-				opts.IncludeSnapshots,
-			)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				return nil
-			}
-			if !yield(rec, nil) {
-				return errStopStream
-			}
+		if !ok {
 			return nil
-		})
-		if errors.Is(err, errStopStream) {
-			return
 		}
+		if !yield(rec, nil) {
+			return errStopStream
+		}
+		return nil
+	})
+	if errors.Is(err, errStopStream) {
+		return
+	}
+	if err != nil {
+		yield(event.StoredEvent{}, err)
+	}
+}
+
+func (s *EventStore) streamGeneric(ctx context.Context, ref event.AggregateRef, yield func(event.StoredEvent, error) bool) {
+	read, err := s.resolveGenericReadContext(ctx, ref)
+	if errors.Is(err, errStreamNotFound) {
+		return
+	}
+	if err != nil {
+		yield(event.StoredEvent{}, err)
+		return
+	}
+
+	consumer, err := openAggregateConsumer(ctx, read.stream, read.filter, 1)
+	if err != nil {
+		yield(event.StoredEvent{}, err)
+		return
+	}
+
+	_, err = s.forEachAggregateMessage(ctx, consumer, func(subject string, data []byte, timestamp time.Time, version uint64) error {
+		rec, err := genericStoredEventFromMessage(subject, data, timestamp, version)
 		if err != nil {
-			yield(event.StoredEvent{}, err)
+			return err
 		}
+		if !yield(rec, nil) {
+			return errStopStream
+		}
+		return nil
+	})
+	if errors.Is(err, errStopStream) {
+		return
+	}
+	if err != nil {
+		yield(event.StoredEvent{}, err)
 	}
 }
 
