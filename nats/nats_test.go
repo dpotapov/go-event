@@ -11,6 +11,8 @@ import (
 	"github.com/dpotapov/go-event"
 	goeventnats "github.com/dpotapov/go-event/nats"
 	"github.com/dpotapov/go-event/testkit/natstest"
+	"github.com/nats-io/nats-server/v2/server"
+	gonats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/require"
 )
@@ -664,6 +666,76 @@ func TestQueueSubscriptionCreatesConsumerWithPreciseFilters(t *testing.T) {
 	cfg := consumer.CachedInfo().Config
 	require.Empty(t, cfg.FilterSubject)
 	require.ElementsMatch(t, []string{"test.event.account.*.created", "test.event.account.*.renamed"}, cfg.FilterSubjects)
+}
+
+func TestNATSBusScopedQueueConsumerUsesLongFormCreatePermission(t *testing.T) {
+	const (
+		queue      = "svc"
+		streamName = "TEST_ACCOUNT_EVENTS"
+	)
+	allPerms := &server.Permissions{
+		Publish:   &server.SubjectPermission{Allow: []string{">"}},
+		Subscribe: &server.SubjectPermission{Allow: []string{">"}},
+	}
+	scopedPerms := &server.Permissions{
+		Publish: &server.SubjectPermission{Allow: []string{
+			"$JS.API.CONSUMER.CREATE." + streamName + "." + queue + ".test.event.account.acct-1.>",
+			"$JS.API.CONSUMER.MSG.NEXT." + streamName + "." + queue,
+			"$JS.ACK." + streamName + "." + queue + ".>",
+		}},
+		Subscribe: &server.SubjectPermission{Allow: []string{"_INBOX.>"}},
+	}
+	env := natstest.Run(t, natstest.WithServerOptions(func(opts *server.Options) {
+		opts.NoAuthUser = "admin"
+		opts.Users = []*server.User{
+			{Username: "admin", Password: "admin", Permissions: allPerms},
+			{Username: "scoped", Password: "scoped", Permissions: scopedPerms},
+		}
+	}))
+	stream := env.CreateEventStream(t, "test", "account")
+	info, err := stream.Info(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, streamName, info.Config.Name)
+
+	scopedConn, err := gonats.Connect(env.URL, gonats.UserInfo("scoped", "scoped"))
+	require.NoError(t, err)
+	t.Cleanup(scopedConn.Close)
+	eventSub, err := goeventnats.NewSubscriber(scopedConn, goeventnats.SubscriberConfig{})
+	require.NoError(t, err)
+	bus := event.NewBus(nil, nil, nil, eventSub, event.BusOptions{Queue: queue})
+
+	seen := make(chan string, 2)
+	event.HandleQueueEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+		seen <- evt.EventName()
+		return nil
+	}, event.WithAggregateIDs("acct-1"))
+	event.HandleQueueEvent(bus, func(ctx context.Context, evt *accountRenamed) error {
+		seen <- evt.EventName()
+		return nil
+	}, event.WithAggregateIDs("acct-1"))
+
+	require.NoError(t, bus.Connect(t.Context()))
+	t.Cleanup(func() { require.NoError(t, bus.Disconnect()) })
+
+	var names []string
+	require.Eventually(t, func() bool {
+		names = env.ConsumerNames(t, info.Config.Name)
+		return len(names) == 1
+	}, 5*time.Second, 50*time.Millisecond)
+	require.Equal(t, []string{queue}, names)
+
+	consumer, err := env.JetStream.Consumer(t.Context(), info.Config.Name, names[0])
+	require.NoError(t, err)
+	cfg := consumer.CachedInfo().Config
+	require.Equal(t, "test.event.account.acct-1.>", cfg.FilterSubject)
+	require.Empty(t, cfg.FilterSubjects)
+
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
+	require.NoError(t, err)
+	require.NoError(t, store.Save(t.Context(), &account{ID: "acct-1"}, 0, &accountCreated{AccountID: "acct-1", Name: "Acme"}))
+	require.NoError(t, store.Save(t.Context(), &account{ID: "acct-1", Name: "Acme"}, 1, &accountRenamed{AccountID: "acct-1", Name: "Fresh"}))
+	require.Equal(t, "created", receive(t, seen))
+	require.Equal(t, "renamed", receive(t, seen))
 }
 
 func TestNATSBusQueueHandlerSupportsCustomEventKind(t *testing.T) {

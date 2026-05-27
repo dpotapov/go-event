@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -123,7 +124,7 @@ func (s *Subscriber) subscribeOrdered(ctx context.Context, handler goevent.Event
 
 func (s *Subscriber) subscribeQueue(ctx context.Context, handler goevent.EventHandler, cfg goevent.EventSubscriptionConfig) (goevent.Subscription, error) {
 	stream := s.streamFor(cfg.AggregateScope, cfg.AggregateTypes[0])
-	filters := eventFilters(cfg)
+	filters := queueConsumerFilters(cfg)
 	name := cfg.ConsumerName
 	if name == "" {
 		name = cfg.Queue
@@ -161,6 +162,68 @@ func (s *Subscriber) subscribeQueue(ctx context.Context, handler goevent.EventHa
 		return nil, fmt.Errorf("create queue consumer %s: %w", name, err)
 	}
 	return s.consume(ctx, consumer, handler, cfg)
+}
+
+func queueConsumerFilters(cfg goevent.EventSubscriptionConfig) []string {
+	filters := eventFilters(cfg)
+	if len(filters) <= 1 {
+		return filters
+	}
+	if filter, ok := aggregateInstanceQueueFilter(cfg); ok {
+		return []string{filter}
+	}
+	return filters
+}
+
+func aggregateInstanceQueueFilter(cfg goevent.EventSubscriptionConfig) (string, bool) {
+	kind, id, ok := aggregateInstanceQueueScope(cfg)
+	if !ok {
+		return "", false
+	}
+	return strings.Join([]string{
+		cfg.AggregateScope,
+		string(kind),
+		cfg.AggregateTypes[0],
+		id,
+		">",
+	}, "."), true
+}
+
+func aggregateInstanceQueueScope(cfg goevent.EventSubscriptionConfig) (goevent.MessageKind, string, bool) {
+	if len(cfg.EventFilters) == 0 {
+		if len(cfg.AggregateIDs) != 1 {
+			return "", "", false
+		}
+		kind := cfg.Kind
+		if kind == "" {
+			kind = goevent.KindEvent
+		}
+		return kind, cfg.AggregateIDs[0], true
+	}
+
+	var (
+		outKind goevent.MessageKind
+		outID   string
+	)
+	for _, filter := range cfg.EventFilters {
+		if len(filter.AggregateIDs) != 1 {
+			return "", "", false
+		}
+		kind := filter.Kind
+		if kind == "" {
+			kind = goevent.KindEvent
+		}
+		id := filter.AggregateIDs[0]
+		if outKind == "" {
+			outKind = kind
+			outID = id
+			continue
+		}
+		if outKind != kind || outID != id {
+			return "", "", false
+		}
+	}
+	return outKind, outID, outKind != "" && outID != ""
 }
 
 func (s *Subscriber) consume(ctx context.Context, consumer jetstream.Consumer, handler goevent.EventHandler, cfg goevent.EventSubscriptionConfig) (goevent.Subscription, error) {
