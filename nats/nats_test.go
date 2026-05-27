@@ -551,6 +551,83 @@ func TestNATSBusPublishDeliversCustomEventKind(t *testing.T) {
 	require.Equal(t, "started", receive(t, seen))
 }
 
+func TestNATSBusQueueMaxRetriesControlsRedeliveryAndEscalation(t *testing.T) {
+	env := natstest.Run(t)
+	stream := env.CreateEventStream(t, "test", "account")
+	info, err := stream.Info(t.Context())
+	require.NoError(t, err)
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
+	require.NoError(t, err)
+
+	subErrs := make(chan *event.SubscriptionError, 1)
+	bus, err := goeventnats.NewBus(env.Conn, goeventnats.BusConfig{
+		Queue:           "svc",
+		QueueMaxRetries: 2,
+		OnSubscriptionError: func(err *event.SubscriptionError) bool {
+			subErrs <- err
+			return true
+		},
+	})
+	require.NoError(t, err)
+
+	deliveries := make(chan uint64, 3)
+	release := make(chan struct{}, 3)
+	event.HandleQueueEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+		meta, _ := event.MessageMetadataFromContext(ctx)
+		deliveries <- meta.NumDelivered
+		<-release
+		return errors.New("boom")
+	})
+	require.NoError(t, bus.Connect(t.Context()))
+	t.Cleanup(func() { require.NoError(t, bus.Disconnect()) })
+
+	var consumerName string
+	require.Eventually(t, func() bool {
+		names := env.ConsumerNames(t, info.Config.Name)
+		if len(names) != 1 {
+			return false
+		}
+		consumerName = names[0]
+		return true
+	}, 5*time.Second, 50*time.Millisecond)
+	consumer, err := env.JetStream.Consumer(t.Context(), info.Config.Name, consumerName)
+	require.NoError(t, err)
+	consumerInfo, err := consumer.Info(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, 3, consumerInfo.Config.MaxDeliver)
+
+	require.NoError(t, store.Save(t.Context(), &account{ID: "acct-1"}, 0, &accountCreated{AccountID: "acct-1", Name: "Acme"}))
+	require.Equal(t, uint64(1), receive(t, deliveries))
+	release <- struct{}{}
+	require.Equal(t, uint64(2), receive(t, deliveries))
+	select {
+	case err := <-subErrs:
+		t.Fatalf("subscription error before retries exhausted: %+v", err)
+	default:
+	}
+	release <- struct{}{}
+	require.Equal(t, uint64(3), receive(t, deliveries))
+	select {
+	case err := <-subErrs:
+		t.Fatalf("subscription error before final delivery failed: %+v", err)
+	default:
+	}
+	release <- struct{}{}
+
+	subErr := receive(t, subErrs)
+	require.Equal(t, "svc", subErr.Queue)
+	require.Equal(t, uint64(3), subErr.NumDelivered)
+	require.True(t, subErr.RetriesExhausted)
+	require.Equal(t, event.Subject{
+		Scope:         "test",
+		Kind:          event.KindEvent,
+		AggregateType: "account",
+		AggregateID:   "acct-1",
+		Name:          "created",
+	}, subErr.Subject)
+	require.ErrorContains(t, subErr.Err, "boom")
+}
+
 func TestQueueSubscriptionCreatesConsumerWithPreciseFilters(t *testing.T) {
 	env := natstest.Run(t)
 	stream := env.CreateEventStream(t, "test", "account")

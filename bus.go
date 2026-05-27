@@ -13,6 +13,7 @@ import (
 
 type BusOptions struct {
 	Queue                    string
+	QueueMaxRetries          int
 	Logger                   *slog.Logger
 	CursorStore              CursorStore
 	CursorBootPolicy         CursorBootPolicy
@@ -33,6 +34,7 @@ type Bus struct {
 	cursorStore              CursorStore
 	cursorBootPolicy         CursorBootPolicy
 	onSubscriptionError      func(*SubscriptionError) bool
+	queueMaxRetries          int
 	commandConflictRetries   int
 	excludeCommandDebugNames map[string]bool
 
@@ -73,6 +75,7 @@ func NewBus(dispatcher Dispatcher, publisher Publisher, commands CommandSubscrib
 		cursorStore:              opts.CursorStore,
 		cursorBootPolicy:         opts.CursorBootPolicy,
 		onSubscriptionError:      opts.OnSubscriptionError,
+		queueMaxRetries:          opts.QueueMaxRetries,
 		commandConflictRetries:   retries,
 		excludeCommandDebugNames: opts.ExcludeCommandDebugNames,
 		orderedGroups:            make(map[orderedKey]*eventGroup),
@@ -478,6 +481,7 @@ func (b *Bus) startQueueGroup(ctx context.Context, group *eventGroup) error {
 		EventFilters:   eventFilters,
 		Queue:          group.queue,
 		ConsumerName:   consumerName,
+		MaxRetries:     b.queueMaxRetries,
 		OnError:        b.makeOnError(true),
 	})
 	if err != nil {

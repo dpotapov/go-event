@@ -12,6 +12,7 @@ import (
 // BusConfig configures the NATS-backed bus helper.
 type BusConfig struct {
 	Queue                  string
+	QueueMaxRetries        int
 	RequestTimeout         time.Duration
 	Logger                 *slog.Logger
 	CursorStore            goevent.CursorStore
@@ -50,6 +51,7 @@ func NewBus(nc *gonats.Conn, cfg BusConfig) (*goevent.Bus, error) {
 	}
 	return goevent.NewBus(dispatcher, publisher, commands, events, goevent.BusOptions{
 		Queue:                  cfg.Queue,
+		QueueMaxRetries:        cfg.QueueMaxRetries,
 		Logger:                 cfg.Logger,
 		CursorStore:            cfg.CursorStore,
 		CursorBootPolicy:       cfg.CursorBootPolicy,

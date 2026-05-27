@@ -496,6 +496,27 @@ func TestBusQueueHandlersShareSubscriptionWithEventNameFilters(t *testing.T) {
 	require.Equal(t, "svc", cfg.ConsumerName)
 }
 
+func TestBusQueueHandlersPassQueueMaxRetries(t *testing.T) {
+	events := &recordingEventSubscriber{}
+	bus := NewBus(nil, nil, nil, events, BusOptions{Queue: "svc", QueueMaxRetries: 10})
+
+	HandleEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+		return nil
+	})
+	HandleQueueEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+		return nil
+	})
+
+	require.NoError(t, bus.Connect(t.Context()))
+	t.Cleanup(func() { require.NoError(t, bus.Disconnect()) })
+
+	require.Len(t, events.subs, 2)
+	require.Empty(t, events.subs[0].Queue)
+	require.Zero(t, events.subs[0].MaxRetries)
+	require.Equal(t, "svc", events.subs[1].Queue)
+	require.Equal(t, 10, events.subs[1].MaxRetries)
+}
+
 func TestBusQueueHandlersBuildMinimalStreamFilters(t *testing.T) {
 	events := &recordingEventSubscriber{}
 	bus := NewBus(nil, nil, nil, events, BusOptions{Queue: "svc"})
