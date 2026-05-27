@@ -124,53 +124,43 @@ func (s *Subscriber) subscribeOrdered(ctx context.Context, handler goevent.Event
 func (s *Subscriber) subscribeQueue(ctx context.Context, handler goevent.EventHandler, cfg goevent.EventSubscriptionConfig) (goevent.Subscription, error) {
 	stream := s.streamFor(cfg.AggregateScope, cfg.AggregateTypes[0])
 	filters := eventFilters(cfg)
-	group := &subscriptionGroup{}
-	for _, filter := range filters {
-		name := cfg.ConsumerName
-		if name == "" {
-			name = cfg.Queue
-		}
-		if len(filters) > 1 {
-			name = consumerName(name, filter)
-		} else {
-			name = sanitizeName(name)
-		}
-		consumerCfg := jetstream.ConsumerConfig{
-			Name:          name,
-			Durable:       name,
-			FilterSubject: filter,
-			AckPolicy:     jetstream.AckExplicitPolicy,
-			DeliverPolicy: jetstream.DeliverAllPolicy,
-			ReplayPolicy:  jetstream.ReplayInstantPolicy,
-			AckWait:       30 * time.Second,
-			MaxDeliver:    1,
-		}
-		switch {
-		case cfg.MaxRetries < 0:
-			consumerCfg.MaxDeliver = -1
-		case cfg.MaxRetries > 0:
-			consumerCfg.MaxDeliver = cfg.MaxRetries + 1
-		}
-		if cfg.Cursor != nil {
-			consumerCfg.DeliverPolicy = jetstream.DeliverByStartSequencePolicy
-			consumerCfg.OptStartSeq = cursorToSeq(cfg.Cursor) + 1
-		}
-		if s.consumerConfig != nil {
-			s.consumerConfig(&consumerCfg)
-		}
-		consumer, err := s.js.CreateOrUpdateConsumer(ctx, stream, consumerCfg)
-		if err != nil {
-			_ = group.Stop()
-			return nil, fmt.Errorf("create queue consumer %s: %w", name, err)
-		}
-		sub, err := s.consume(ctx, consumer, handler, cfg)
-		if err != nil {
-			_ = group.Stop()
-			return nil, err
-		}
-		group.subs = append(group.subs, sub)
+	name := cfg.ConsumerName
+	if name == "" {
+		name = cfg.Queue
 	}
-	return group, nil
+	name = sanitizeName(name)
+	consumerCfg := jetstream.ConsumerConfig{
+		Name:          name,
+		Durable:       name,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		DeliverPolicy: jetstream.DeliverAllPolicy,
+		ReplayPolicy:  jetstream.ReplayInstantPolicy,
+		AckWait:       30 * time.Second,
+		MaxDeliver:    1,
+	}
+	if len(filters) == 1 {
+		consumerCfg.FilterSubject = filters[0]
+	} else {
+		consumerCfg.FilterSubjects = filters
+	}
+	switch {
+	case cfg.MaxRetries < 0:
+		consumerCfg.MaxDeliver = -1
+	case cfg.MaxRetries > 0:
+		consumerCfg.MaxDeliver = cfg.MaxRetries + 1
+	}
+	if cfg.Cursor != nil {
+		consumerCfg.DeliverPolicy = jetstream.DeliverByStartSequencePolicy
+		consumerCfg.OptStartSeq = cursorToSeq(cfg.Cursor) + 1
+	}
+	if s.consumerConfig != nil {
+		s.consumerConfig(&consumerCfg)
+	}
+	consumer, err := s.js.CreateOrUpdateConsumer(ctx, stream, consumerCfg)
+	if err != nil {
+		return nil, fmt.Errorf("create queue consumer %s: %w", name, err)
+	}
+	return s.consume(ctx, consumer, handler, cfg)
 }
 
 func (s *Subscriber) consume(ctx context.Context, consumer jetstream.Consumer, handler goevent.EventHandler, cfg goevent.EventSubscriptionConfig) (goevent.Subscription, error) {
@@ -209,20 +199,6 @@ func (s *Subscriber) consume(ctx context.Context, consumer jetstream.Consumer, h
 
 func (s *Subscriber) streamFor(scope, aggregateType string) string {
 	return StreamName(s.streamPattern, scope, aggregateType)
-}
-
-type subscriptionGroup struct {
-	subs []goevent.Subscription
-}
-
-func (g *subscriptionGroup) Stop() error {
-	var firstErr error
-	for _, sub := range g.subs {
-		if err := sub.Stop(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
 }
 
 type consumeSession struct {
@@ -317,15 +293,7 @@ func (s *consumeSession) decodeEvent(msg jetstream.Msg, meta *jetstream.MsgMetad
 		s.ack(msg, logger)
 		return nil, false
 	}
-	kind := s.cfg.Kind
-	if kind == "" {
-		kind = goevent.KindEvent
-	}
-	if subj.Kind != kind {
-		s.ack(msg, logger)
-		return nil, false
-	}
-	if len(s.cfg.EventNames) > 0 && !slices.Contains(s.cfg.EventNames, subj.Name) {
+	if !subscriptionSubjectMatches(s.cfg, subj) {
 		s.ack(msg, logger)
 		return nil, false
 	}
@@ -351,6 +319,39 @@ func (s *consumeSession) decodeEvent(msg jetstream.Msg, meta *jetstream.MsgMetad
 		return nil, false
 	}
 	return evt, true
+}
+
+func subscriptionSubjectMatches(cfg goevent.EventSubscriptionConfig, subj goevent.Subject) bool {
+	if len(cfg.EventFilters) > 0 {
+		for _, filter := range cfg.EventFilters {
+			if eventFilterMatchesSubject(filter, subj) {
+				return true
+			}
+		}
+		return false
+	}
+	kind := cfg.Kind
+	if kind == "" {
+		kind = goevent.KindEvent
+	}
+	if subj.Kind != kind {
+		return false
+	}
+	return len(cfg.EventNames) == 0 || slices.Contains(cfg.EventNames, subj.Name)
+}
+
+func eventFilterMatchesSubject(filter goevent.EventSubscriptionFilter, subj goevent.Subject) bool {
+	kind := filter.Kind
+	if kind == "" {
+		kind = goevent.KindEvent
+	}
+	if subj.Kind != kind {
+		return false
+	}
+	if len(filter.AggregateIDs) > 0 && !slices.Contains(filter.AggregateIDs, subj.AggregateID) {
+		return false
+	}
+	return len(filter.EventNames) == 0 || slices.Contains(filter.EventNames, subj.Name)
 }
 
 func (s *consumeSession) heartbeat(msg jetstream.Msg, logger *slog.Logger, done <-chan struct{}) {

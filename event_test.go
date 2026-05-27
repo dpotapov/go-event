@@ -20,6 +20,26 @@ func (e *accountCreated) AggregateType() string  { return "account" }
 func (e *accountCreated) AggregateID() string    { return e.AccountID }
 func (e *accountCreated) EventName() string      { return "created" }
 
+type accountRenamed struct {
+	AccountID string `json:"account_id"`
+	Name      string `json:"name"`
+}
+
+func (e *accountRenamed) AggregateScope() string { return "billing" }
+func (e *accountRenamed) AggregateType() string  { return "account" }
+func (e *accountRenamed) AggregateID() string    { return e.AccountID }
+func (e *accountRenamed) EventName() string      { return "renamed" }
+
+type accountInfoLogged struct {
+	AccountID string `json:"account_id"`
+}
+
+func (e *accountInfoLogged) AggregateScope() string { return "billing" }
+func (e *accountInfoLogged) MessageKind() string    { return "log" }
+func (e *accountInfoLogged) AggregateType() string  { return "account" }
+func (e *accountInfoLogged) AggregateID() string    { return e.AccountID }
+func (e *accountInfoLogged) EventName() string      { return "info" }
+
 type logEmitted struct {
 	WorkerID string `json:"worker_id"`
 	Level    string `json:"level"`
@@ -441,10 +461,88 @@ func TestBusTypedHandlersUseCustomMessageKind(t *testing.T) {
 	require.NoError(t, bus.Connect(t.Context()))
 	t.Cleanup(func() { require.NoError(t, bus.Disconnect()) })
 
-	require.Equal(t, MessageKind("log"), events.subs[0].Kind)
+	require.Empty(t, events.subs[0].Kind)
 	require.Empty(t, events.subs[0].EventNames)
+	require.Equal(t, []EventSubscriptionFilter{{Kind: MessageKind("log")}}, events.subs[0].EventFilters)
 	require.Equal(t, MessageKind("signal"), commands.commandSubs[0].Kind)
 	require.Equal(t, MessageKind("signal"), commands.querySubs[0].Kind)
+}
+
+func TestBusQueueHandlersShareSubscriptionWithEventNameFilters(t *testing.T) {
+	events := &recordingEventSubscriber{}
+	bus := NewBus(nil, nil, nil, events, BusOptions{Queue: "svc"})
+
+	HandleQueueEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+		return nil
+	})
+	HandleQueueEvent(bus, func(ctx context.Context, evt *accountRenamed) error {
+		return nil
+	})
+
+	require.NoError(t, bus.Connect(t.Context()))
+	t.Cleanup(func() { require.NoError(t, bus.Disconnect()) })
+
+	require.Len(t, events.subs, 1)
+	cfg := events.subs[0]
+	require.Equal(t, "billing", cfg.AggregateScope)
+	require.Equal(t, []string{"account"}, cfg.AggregateTypes)
+	require.Empty(t, cfg.AggregateIDs)
+	require.Empty(t, cfg.EventNames)
+	require.ElementsMatch(t, []EventSubscriptionFilter{
+		{Kind: KindEvent, EventNames: []string{"created"}},
+		{Kind: KindEvent, EventNames: []string{"renamed"}},
+	}, cfg.EventFilters)
+	require.Equal(t, "svc", cfg.Queue)
+	require.Equal(t, "svc", cfg.ConsumerName)
+}
+
+func TestBusQueueHandlersBuildMinimalStreamFilters(t *testing.T) {
+	events := &recordingEventSubscriber{}
+	bus := NewBus(nil, nil, nil, events, BusOptions{Queue: "svc"})
+
+	var allCalls int
+	var acct1Calls int
+	var logCalls int
+	HandleQueueEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+		allCalls++
+		return nil
+	})
+	HandleQueueEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+		acct1Calls++
+		return nil
+	}, WithAggregateIDs("acct-1"))
+	HandleQueueEvent(bus, func(ctx context.Context, evt *accountInfoLogged) error {
+		logCalls++
+		return nil
+	}, WithAggregateIDs("acct-1"))
+
+	require.NoError(t, bus.Connect(t.Context()))
+	t.Cleanup(func() { require.NoError(t, bus.Disconnect()) })
+
+	require.Len(t, events.subs, 1)
+	cfg := events.subs[0]
+	require.Empty(t, cfg.AggregateIDs)
+	require.Empty(t, cfg.EventNames)
+	require.ElementsMatch(t, []EventSubscriptionFilter{
+		{Kind: KindEvent, EventNames: []string{"created"}},
+		{Kind: MessageKind("log"), AggregateIDs: []string{"acct-1"}, EventNames: []string{"info"}},
+	}, cfg.EventFilters)
+	require.Equal(t, "svc", cfg.ConsumerName)
+
+	require.NoError(t, events.h[0].HandleEvent(t.Context(), &accountCreated{AccountID: "acct-2"}, nil))
+	require.Equal(t, 1, allCalls)
+	require.Equal(t, 0, acct1Calls)
+	require.Equal(t, 0, logCalls)
+
+	require.NoError(t, events.h[0].HandleEvent(t.Context(), &accountCreated{AccountID: "acct-1"}, nil))
+	require.Equal(t, 2, allCalls)
+	require.Equal(t, 1, acct1Calls)
+	require.Equal(t, 0, logCalls)
+
+	require.NoError(t, events.h[0].HandleEvent(t.Context(), &accountInfoLogged{AccountID: "acct-1"}, nil))
+	require.Equal(t, 2, allCalls)
+	require.Equal(t, 1, acct1Calls)
+	require.Equal(t, 1, logCalls)
 }
 
 func TestBusConnectStartsOrderedHandlersBeforeCommandsAndQueues(t *testing.T) {

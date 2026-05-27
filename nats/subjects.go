@@ -3,7 +3,7 @@ package nats
 import (
 	"crypto/sha1"
 	"encoding/hex"
-	"fmt"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -45,6 +45,9 @@ func QuerySubject(query event.Command) string {
 }
 
 func eventFilters(cfg event.EventSubscriptionConfig) []string {
+	if len(cfg.EventFilters) > 0 {
+		return compactSubjectFilters(eventFilterSubjects(cfg))
+	}
 	kind := cfg.Kind
 	if kind == "" {
 		kind = event.KindEvent
@@ -55,6 +58,31 @@ func eventFilters(cfg event.EventSubscriptionConfig) []string {
 
 	filters := make([]string, 0, len(types)*len(ids)*len(names))
 	for _, typ := range types {
+		for _, id := range ids {
+			for _, name := range names {
+				filters = append(filters, strings.Join([]string{
+					cfg.AggregateScope,
+					string(kind),
+					typ,
+					id,
+					name,
+				}, "."))
+			}
+		}
+	}
+	return compactSubjectFilters(filters)
+}
+
+func eventFilterSubjects(cfg event.EventSubscriptionConfig) []string {
+	typ := cfg.AggregateTypes[0]
+	filters := make([]string, 0, len(cfg.EventFilters))
+	for _, filter := range cfg.EventFilters {
+		kind := filter.Kind
+		if kind == "" {
+			kind = event.KindEvent
+		}
+		ids := wildcardIfEmpty(filter.AggregateIDs)
+		names := wildcardIfEmpty(filter.EventNames)
 		for _, id := range ids {
 			for _, name := range names {
 				filters = append(filters, strings.Join([]string{
@@ -106,6 +134,50 @@ func wildcardIfEmpty(values []string) []string {
 	return values
 }
 
+func compactSubjectFilters(filters []string) []string {
+	seen := make(map[string]struct{}, len(filters))
+	deduped := make([]string, 0, len(filters))
+	for _, filter := range filters {
+		if _, ok := seen[filter]; ok {
+			continue
+		}
+		seen[filter] = struct{}{}
+		deduped = append(deduped, filter)
+	}
+	out := make([]string, 0, len(deduped))
+	for _, filter := range deduped {
+		covered := false
+		for _, candidate := range deduped {
+			if candidate == filter {
+				continue
+			}
+			if subjectFilterCovers(candidate, filter) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			out = append(out, filter)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+func subjectFilterCovers(candidate, filter string) bool {
+	candidateParts := strings.Split(candidate, ".")
+	filterParts := strings.Split(filter, ".")
+	if len(candidateParts) != len(filterParts) {
+		return false
+	}
+	for i := range candidateParts {
+		if candidateParts[i] != "*" && candidateParts[i] != filterParts[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func ParseSubject(subject string) (event.Subject, bool) {
 	parts := strings.Split(subject, ".")
 	if len(parts) != 5 {
@@ -119,18 +191,6 @@ func ParseSubject(subject string) (event.Subject, bool) {
 		Name:          parts[4],
 	}
 	return subj, subj.Validate() == nil
-}
-
-func consumerName(base, filter string) string {
-	if base == "" {
-		base = "goevent"
-	}
-	name := sanitizeName(base)
-	if filter == "" {
-		return name
-	}
-	sum := sha1.Sum([]byte(filter))
-	return fmt.Sprintf("%s_%s", name, hex.EncodeToString(sum[:])[:12])
 }
 
 func sanitizeName(name string) string {

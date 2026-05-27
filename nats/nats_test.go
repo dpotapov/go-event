@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -55,6 +54,16 @@ func (e *accountRenamed) AggregateScope() string { return "test" }
 func (e *accountRenamed) AggregateType() string  { return "account" }
 func (e *accountRenamed) AggregateID() string    { return e.AccountID }
 func (e *accountRenamed) EventName() string      { return "renamed" }
+
+type accountInfoLogged struct {
+	AccountID string `json:"account_id"`
+}
+
+func (e *accountInfoLogged) AggregateScope() string { return "test" }
+func (e *accountInfoLogged) MessageKind() string    { return "log" }
+func (e *accountInfoLogged) AggregateType() string  { return "account" }
+func (e *accountInfoLogged) AggregateID() string    { return e.AccountID }
+func (e *accountInfoLogged) EventName() string      { return "info" }
 
 type accountSnapshot struct {
 	event.SnapshotEventBase
@@ -414,6 +423,80 @@ func TestNATSBusEndToEnd(t *testing.T) {
 	require.Equal(t, "acct-1", receive(t, queueSeen))
 }
 
+func TestNATSBusQueueHandlersBuildMinimalConsumerFilters(t *testing.T) {
+	env := natstest.Run(t)
+	stream, err := env.JetStream.CreateOrUpdateStream(t.Context(), jetstream.StreamConfig{
+		Name:        goeventnats.StreamName(goeventnats.DefaultStreamPattern, "test", "account"),
+		Subjects:    []string{"test.event.account.>", "test.log.account.>"},
+		Storage:     jetstream.MemoryStorage,
+		Retention:   jetstream.LimitsPolicy,
+		AllowDirect: true,
+	})
+	require.NoError(t, err)
+	info, err := stream.Info(t.Context())
+	require.NoError(t, err)
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
+	require.NoError(t, err)
+	eventSub, err := goeventnats.NewSubscriber(env.Conn, goeventnats.SubscriberConfig{})
+	require.NoError(t, err)
+	bus := event.NewBus(nil, nil, nil, eventSub, event.BusOptions{Queue: "svc"})
+
+	seen := make(chan string, 3)
+	event.HandleQueueEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+		seen <- evt.EventName()
+		return nil
+	})
+	event.HandleQueueEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+		seen <- "acct-1-" + evt.EventName()
+		return nil
+	}, event.WithAggregateIDs("acct-1"))
+	event.HandleQueueEvent(bus, func(ctx context.Context, evt *accountInfoLogged) error {
+		seen <- evt.MessageKind() + "-" + evt.EventName()
+		return nil
+	}, event.WithAggregateIDs("acct-1"))
+
+	require.NoError(t, bus.Connect(t.Context()))
+	t.Cleanup(func() { require.NoError(t, bus.Disconnect()) })
+
+	var names []string
+	require.Eventually(t, func() bool {
+		names = env.ConsumerNames(t, info.Config.Name)
+		return len(names) == 1
+	}, 5*time.Second, 50*time.Millisecond)
+	require.Equal(t, []string{"svc"}, names)
+
+	consumer, err := env.JetStream.Consumer(t.Context(), info.Config.Name, names[0])
+	require.NoError(t, err)
+	cfg := consumer.CachedInfo().Config
+	require.Empty(t, cfg.FilterSubject)
+	require.ElementsMatch(t, []string{
+		"test.event.account.*.created",
+		"test.log.account.acct-1.info",
+	}, cfg.FilterSubjects)
+
+	require.NoError(t, store.Save(t.Context(), &account{ID: "acct-1"}, 0, &accountCreated{AccountID: "acct-1", Name: "Acme"}))
+	require.Equal(t, "created", receive(t, seen))
+	require.Equal(t, "acct-1-created", receive(t, seen))
+	require.NoError(t, store.Save(t.Context(), &account{ID: "acct-1"}, 1, &accountInfoLogged{AccountID: "acct-1"}))
+	require.Equal(t, "log-info", receive(t, seen))
+
+	require.Eventually(t, func() bool {
+		info, err := consumer.Info(t.Context())
+		require.NoError(t, err)
+		return info.Delivered.Stream == 2
+	}, 5*time.Second, 50*time.Millisecond)
+
+	_, err = env.JetStream.Publish(t.Context(), "test.event.account.acct-1.deleted", []byte(`{"account_id":"acct-1"}`))
+	require.NoError(t, err)
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		info, err := consumer.Info(t.Context())
+		require.NoError(t, err)
+		require.Equal(t, uint64(2), info.Delivered.Stream)
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func TestNewBusConstructsNATSPrimitives(t *testing.T) {
 	env := natstest.Run(t)
 	env.CreateEventStream(t, "test", "account")
@@ -468,7 +551,7 @@ func TestNATSBusPublishDeliversCustomEventKind(t *testing.T) {
 	require.Equal(t, "started", receive(t, seen))
 }
 
-func TestQueueSubscriptionCreatesConsumerPerFilter(t *testing.T) {
+func TestQueueSubscriptionCreatesConsumerWithPreciseFilters(t *testing.T) {
 	env := natstest.Run(t)
 	stream := env.CreateEventStream(t, "test", "account")
 	info, err := stream.Info(t.Context())
@@ -492,20 +575,15 @@ func TestQueueSubscriptionCreatesConsumerPerFilter(t *testing.T) {
 	var names []string
 	require.Eventually(t, func() bool {
 		names = env.ConsumerNames(t, info.Config.Name)
-		return len(names) == 2
+		return len(names) == 1
 	}, 5*time.Second, 50*time.Millisecond)
+	require.Equal(t, []string{"projection_account"}, names)
 
-	for _, name := range names {
-		consumer, err := env.JetStream.Consumer(t.Context(), info.Config.Name, name)
-		require.NoError(t, err)
-		cfg := consumer.CachedInfo().Config
-		require.NotEmpty(t, cfg.FilterSubject)
-		require.Empty(t, cfg.FilterSubjects)
-		require.True(t,
-			slices.Contains([]string{"test.event.account.*.created", "test.event.account.*.renamed"}, cfg.FilterSubject),
-			"unexpected filter subject %q", cfg.FilterSubject,
-		)
-	}
+	consumer, err := env.JetStream.Consumer(t.Context(), info.Config.Name, names[0])
+	require.NoError(t, err)
+	cfg := consumer.CachedInfo().Config
+	require.Empty(t, cfg.FilterSubject)
+	require.ElementsMatch(t, []string{"test.event.account.*.created", "test.event.account.*.renamed"}, cfg.FilterSubjects)
 }
 
 func TestNATSBusQueueHandlerSupportsCustomEventKind(t *testing.T) {

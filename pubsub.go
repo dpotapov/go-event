@@ -81,6 +81,7 @@ type EventSubscriptionConfig struct {
 	AggregateTypes []string
 	AggregateIDs   []string
 	EventNames     []string
+	EventFilters   []EventSubscriptionFilter
 
 	Queue        string
 	ConsumerName string
@@ -92,9 +93,23 @@ type EventSubscriptionConfig struct {
 	OnError          func(*SubscriptionError) bool
 }
 
+type EventSubscriptionFilter struct {
+	Kind         MessageKind
+	AggregateIDs []string
+	EventNames   []string
+}
+
 func (c EventSubscriptionConfig) Validate() error {
 	if len(c.AggregateTypes) > 0 && c.AggregateScope == "" {
 		return fmt.Errorf("invalid event subscription: aggregate scope is required when aggregate types are set")
+	}
+	if len(c.EventFilters) > 0 {
+		if c.Kind != "" || len(c.AggregateIDs) > 0 || len(c.EventNames) > 0 {
+			return fmt.Errorf("invalid event subscription: event filters cannot be combined with kind, aggregate IDs, or event names")
+		}
+		if len(c.AggregateTypes) != 1 {
+			return fmt.Errorf("invalid event subscription: event filters require exactly one aggregate type")
+		}
 	}
 	if c.Kind != "" {
 		if err := ValidateToken("kind", string(c.Kind)); err != nil {
@@ -120,6 +135,23 @@ func (c EventSubscriptionConfig) Validate() error {
 	for i, v := range c.EventNames {
 		if err := ValidateToken(fmt.Sprintf("event name[%d]", i), v); err != nil {
 			return err
+		}
+	}
+	for i, filter := range c.EventFilters {
+		if filter.Kind != "" {
+			if err := ValidateToken(fmt.Sprintf("event filter[%d] kind", i), string(filter.Kind)); err != nil {
+				return err
+			}
+		}
+		for j, v := range filter.AggregateIDs {
+			if err := ValidateToken(fmt.Sprintf("event filter[%d] aggregate id[%d]", i, j), v); err != nil {
+				return err
+			}
+		}
+		for j, v := range filter.EventNames {
+			if err := ValidateToken(fmt.Sprintf("event filter[%d] event name[%d]", i, j), v); err != nil {
+				return err
+			}
 		}
 	}
 	if c.AggregateScope != "" {

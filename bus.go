@@ -363,10 +363,7 @@ type orderedKey struct {
 
 type queueKey struct {
 	scope string
-	kind  MessageKind
 	agg   string
-	id    string
-	name  string
 	queue string
 }
 
@@ -375,14 +372,13 @@ type eventGroup struct {
 	scope    string
 	kind     MessageKind
 	agg      string
-	id       string
-	name     string
 	queue    string
 	handlers map[uint64]registeredEventHandler
 	sub      Subscription
 }
 
 type registeredEventHandler struct {
+	eventKind    MessageKind
 	eventName    string
 	aggregateIDs []string
 	handler      EventHandler
@@ -398,32 +394,23 @@ func (b *Bus) addOrderedHandler(kind MessageKind, scope, agg, name string, ids [
 		group = &eventGroup{ordered: true, scope: scope, kind: kind, agg: agg, handlers: make(map[uint64]registeredEventHandler)}
 		b.orderedGroups[key] = group
 	}
-	group.handlers[uint64(len(group.handlers)+1)] = registeredEventHandler{eventName: name, aggregateIDs: ids, handler: handler}
+	group.handlers[uint64(len(group.handlers)+1)] = registeredEventHandler{eventKind: kind, eventName: name, aggregateIDs: ids, handler: handler}
 }
 
 func (b *Bus) addQueueHandler(kind MessageKind, scope, agg, name string, ids []string, handler EventHandler) {
 	if b.queue == "" {
 		panic("queue event handler requires BusOptions.Queue")
 	}
-	if len(ids) == 0 {
-		ids = []string{""}
-	}
-	for _, idFilter := range ids {
-		b.addOneQueueHandler(kind, scope, agg, idFilter, name, handler)
-	}
-}
-
-func (b *Bus) addOneQueueHandler(kind MessageKind, scope, agg, idFilter, name string, handler EventHandler) {
-	key := queueKey{scope: scope, kind: kind, agg: agg, id: idFilter, name: name, queue: b.queue}
+	key := queueKey{scope: scope, agg: agg, queue: b.queue}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.mustAllowRegistrationLocked()
 	group := b.queueGroups[key]
 	if group == nil {
-		group = &eventGroup{scope: scope, kind: kind, agg: agg, id: idFilter, name: name, queue: b.queue, handlers: make(map[uint64]registeredEventHandler)}
+		group = &eventGroup{scope: scope, kind: kind, agg: agg, queue: b.queue, handlers: make(map[uint64]registeredEventHandler)}
 		b.queueGroups[key] = group
 	}
-	group.handlers[uint64(len(group.handlers)+1)] = registeredEventHandler{eventName: name, handler: handler}
+	group.handlers[uint64(len(group.handlers)+1)] = registeredEventHandler{eventKind: kind, eventName: name, aggregateIDs: ids, handler: handler}
 }
 
 func (b *Bus) startOrderedGroup(ctx context.Context, group *eventGroup, caughtUp chan<- struct{}) error {
@@ -481,18 +468,14 @@ func (b *Bus) startQueueGroup(ctx context.Context, group *eventGroup) error {
 	if b.events == nil {
 		return ErrNoResponders
 	}
-	ids := []string(nil)
-	if group.id != "" {
-		ids = []string{group.id}
-	}
-	consumerName := strings.Join([]string{group.queue, group.scope, string(group.kind), group.agg, wildcardName(group.id), group.name}, "_")
+	eventFilters := groupEventFilters(group)
+	consumerName := group.queue
 	sub, err := b.events.SubscribeEvents(ctx, EventHandlerFunc(func(ctx context.Context, evt Event, cursor []byte) error {
 		return b.dispatchEventGroup(ctx, group, evt, cursor)
 	}), EventSubscriptionConfig{
 		AggregateScope: group.scope,
-		Kind:           group.kind,
 		AggregateTypes: []string{group.agg},
-		AggregateIDs:   ids,
+		EventFilters:   eventFilters,
 		Queue:          group.queue,
 		ConsumerName:   consumerName,
 		OnError:        b.makeOnError(true),
@@ -518,7 +501,11 @@ func (b *Bus) dispatchEventGroup(ctx context.Context, group *eventGroup, evt Eve
 	}
 	b.mu.Unlock()
 	var firstErr error
+	evtKind := EventSubject(evt).Kind
 	for _, h := range handlers {
+		if h.eventKind != "" && h.eventKind != evtKind {
+			continue
+		}
 		if h.eventName != "" && h.eventName != evt.EventName() {
 			continue
 		}
@@ -699,9 +686,78 @@ func values[K comparable, V any](m map[K]V) []V {
 	return out
 }
 
-func wildcardName(v string) string {
-	if v == "" {
-		return "all"
+type eventFilterSpec struct {
+	kind MessageKind
+	id   string
+	name string
+}
+
+func groupEventFilters(group *eventGroup) []EventSubscriptionFilter {
+	specs := make([]eventFilterSpec, 0, len(group.handlers))
+	for _, h := range group.handlers {
+		if len(h.aggregateIDs) == 0 {
+			specs = append(specs, eventFilterSpec{kind: h.eventKind, name: h.eventName})
+			continue
+		}
+		for _, id := range h.aggregateIDs {
+			specs = append(specs, eventFilterSpec{kind: h.eventKind, id: id, name: h.eventName})
+		}
 	}
-	return v
+	specs = compactEventFilterSpecs(specs)
+	filters := make([]EventSubscriptionFilter, 0, len(specs))
+	for _, spec := range specs {
+		filter := EventSubscriptionFilter{Kind: spec.kind}
+		if spec.id != "" {
+			filter.AggregateIDs = []string{spec.id}
+		}
+		if spec.name != "" {
+			filter.EventNames = []string{spec.name}
+		}
+		filters = append(filters, filter)
+	}
+	return filters
+}
+
+func compactEventFilterSpecs(filters []eventFilterSpec) []eventFilterSpec {
+	seen := make(map[eventFilterSpec]struct{}, len(filters))
+	deduped := make([]eventFilterSpec, 0, len(filters))
+	for _, filter := range filters {
+		if _, ok := seen[filter]; ok {
+			continue
+		}
+		seen[filter] = struct{}{}
+		deduped = append(deduped, filter)
+	}
+	out := make([]eventFilterSpec, 0, len(deduped))
+	for _, filter := range deduped {
+		covered := false
+		for _, candidate := range deduped {
+			if candidate == filter {
+				continue
+			}
+			if eventFilterSpecCovers(candidate, filter) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			out = append(out, filter)
+		}
+	}
+	slices.SortFunc(out, func(a, b eventFilterSpec) int {
+		if a.kind != b.kind {
+			return strings.Compare(string(a.kind), string(b.kind))
+		}
+		if a.id != b.id {
+			return strings.Compare(a.id, b.id)
+		}
+		return strings.Compare(a.name, b.name)
+	})
+	return out
+}
+
+func eventFilterSpecCovers(candidate, filter eventFilterSpec) bool {
+	return candidate.kind == filter.kind &&
+		(candidate.id == "" || candidate.id == filter.id) &&
+		(candidate.name == "" || candidate.name == filter.name)
 }

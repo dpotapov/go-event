@@ -357,7 +357,7 @@ queue handlers start; queue handlers use precise durable consumers.
 
 ## Queue Consumer Strategy
 
-Queue event subscriptions create one durable consumer per concrete filter instead of
-forcing unrelated subjects into one broad consumer. This avoids over-delivery and keeps
-authorization scopes narrow. If a direct subscription requests multiple event names,
-the NATS adapter creates multiple consumers with stable derived names.
+In the NATS backend, queue handlers on the same event stream share one durable
+consumer named after the queue. For queue `projection` on the `test`/`account`
+stream, the durable is `projection` with filters such as
+`test.event.account.*.created` and `test.log.account.acct-1.info`.

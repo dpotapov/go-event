@@ -154,6 +154,17 @@ func eventConfigMatches(cfg goevent.EventSubscriptionConfig, evt goevent.Event) 
 	if cfg.AggregateScope != "" && cfg.AggregateScope != evt.AggregateScope() {
 		return false
 	}
+	if len(cfg.EventFilters) > 0 {
+		if len(cfg.AggregateTypes) > 0 && !contains(cfg.AggregateTypes, evt.AggregateType()) {
+			return false
+		}
+		for _, filter := range cfg.EventFilters {
+			if eventFilterMatches(filter, evt) {
+				return true
+			}
+		}
+		return false
+	}
 	kind := cfg.Kind
 	if kind == "" {
 		kind = goevent.KindEvent
@@ -171,6 +182,20 @@ func eventConfigMatches(cfg goevent.EventSubscriptionConfig, evt goevent.Event) 
 		return false
 	}
 	return true
+}
+
+func eventFilterMatches(filter goevent.EventSubscriptionFilter, evt goevent.Event) bool {
+	kind := filter.Kind
+	if kind == "" {
+		kind = goevent.KindEvent
+	}
+	if kind != goevent.EventSubject(evt).Kind {
+		return false
+	}
+	if len(filter.AggregateIDs) > 0 && !contains(filter.AggregateIDs, evt.AggregateID()) {
+		return false
+	}
+	return len(filter.EventNames) == 0 || contains(filter.EventNames, evt.EventName())
 }
 
 func commandConfigMatches(cfg goevent.CommandSubscriptionConfig, cmd goevent.Command) bool {
