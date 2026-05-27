@@ -316,7 +316,8 @@ func (s *EventStore) applyMessage(
 	snapshotSuffix string,
 	snapshottable bool,
 ) error {
-	if !snapshottable && strings.HasSuffix(subject, snapshotSuffix) {
+	isSnapshot := strings.HasSuffix(subject, snapshotSuffix)
+	if !snapshottable && isSnapshot {
 		if codec, ok := agg.(Codec); ok {
 			if err := codec.NATSUnmarshal(subject, data, timestamp); err != nil {
 				return fmt.Errorf("decode snapshot %s: %w", subject, err)
@@ -330,10 +331,18 @@ func (s *EventStore) applyMessage(
 	}
 	evt, err := s.decodeEvent(registry, subject, data, timestamp)
 	if err != nil {
+		if !isSnapshot && isUnknownEventError(err) {
+			return nil
+		}
 		return err
 	}
 	agg.Apply(evt)
 	return nil
+}
+
+func isUnknownEventError(err error) bool {
+	var unknown *event.UnknownEventError
+	return errors.As(err, &unknown)
 }
 
 // snapshotForSave uses filtered consumer metadata to count aggregate messages

@@ -154,6 +154,9 @@ func (s *EventStore) storedEventFromMessage(
 	}
 	evt, err := s.decodeEvent(registry, subject, data, timestamp)
 	if err != nil {
+		if !isSnapshot && isUnknownEventError(err) {
+			return event.StoredEvent{}, false, nil
+		}
 		return event.StoredEvent{}, false, err
 	}
 	return event.StoredEvent{

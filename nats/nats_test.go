@@ -157,12 +157,23 @@ type accountView struct {
 	ID string `json:"id"`
 }
 
-type accountWithoutEventTypes struct {
-	account
+type createdOnlyAccount struct {
+	ID      string
+	Name    string
+	Applied []string
 }
 
-func (a *accountWithoutEventTypes) EventTypes() ([]event.Event, event.SnapshotEvent) {
-	return nil, nil
+func (a *createdOnlyAccount) AggregateScope() string { return "test" }
+func (a *createdOnlyAccount) AggregateType() string  { return "account" }
+func (a *createdOnlyAccount) AggregateID() string    { return a.ID }
+func (a *createdOnlyAccount) EventTypes() ([]event.Event, event.SnapshotEvent) {
+	return []event.Event{&accountCreated{}}, nil
+}
+func (a *createdOnlyAccount) Apply(evt event.Event) {
+	a.Applied = append(a.Applied, evt.EventName())
+	if e, ok := evt.(*accountCreated); ok {
+		a.Name = e.Name
+	}
 }
 
 func registerAccountEvents(t testing.TB, registry event.TypeRegistry) {
@@ -337,7 +348,7 @@ func TestEventStoreExplicitSnapshotLoad(t *testing.T) {
 	require.Equal(t, "Acme", loaded.Name)
 }
 
-func TestEventStoreLoadUsesAggregateEventTypes(t *testing.T) {
+func TestEventStoreLoadSkipsUnregisteredEventTypes(t *testing.T) {
 	env := natstest.Run(t)
 	env.CreateEventStream(t, "test", "account")
 
@@ -346,27 +357,19 @@ func TestEventStoreLoadUsesAggregateEventTypes(t *testing.T) {
 
 	agg := &account{ID: "acct-1"}
 	require.NoError(t, store.Save(t.Context(), agg, 0, &accountCreated{AccountID: "acct-1", Name: "Acme"}))
-
-	_, err = store.Load(t.Context(), &accountWithoutEventTypes{account: account{ID: "acct-1"}})
-	require.Error(t, err)
-	var unknown *event.UnknownEventError
-	require.ErrorAs(t, err, &unknown)
-
-	err = event.Execute(t.Context(), store,
-		func() *account {
-			return &account{ID: "acct-1"}
-		},
-		func(ctx context.Context, agg *account, version, attempt uint64) ([]event.Event, error) {
-			require.Equal(t, "Acme", agg.Name)
-			return []event.Event{&accountRenamed{AccountID: agg.ID, Name: "Fresh"}}, nil
-		},
-	)
-	require.NoError(t, err)
+	require.NoError(t, store.Save(t.Context(), agg, 1, &accountRenamed{AccountID: "acct-1", Name: "Fresh"}))
 
 	loaded := &account{ID: "acct-1"}
-	_, err = store.Load(t.Context(), loaded)
+	latestVersion, err := store.Load(t.Context(), loaded)
 	require.NoError(t, err)
 	require.Equal(t, "Fresh", loaded.Name)
+
+	partial := &createdOnlyAccount{ID: "acct-1"}
+	version, err := store.Load(t.Context(), partial)
+	require.NoError(t, err)
+	require.Equal(t, latestVersion, version)
+	require.Equal(t, "Acme", partial.Name)
+	require.Equal(t, []string{"created"}, partial.Applied)
 }
 
 func TestNATSBusEndToEnd(t *testing.T) {
@@ -718,6 +721,24 @@ func TestEventStoreStreamYieldsDomainEventsOldestFirst(t *testing.T) {
 	require.False(t, got[0].Timestamp.IsZero())
 }
 
+func TestEventStoreCollectSkipsUnregisteredEventTypes(t *testing.T) {
+	env := natstest.Run(t)
+	env.CreateEventStream(t, "test", "account")
+
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
+	require.NoError(t, err)
+
+	agg := &account{ID: "acct-1"}
+	require.NoError(t, store.Save(t.Context(), agg, 0, &accountCreated{AccountID: "acct-1", Name: "Acme"}))
+	require.NoError(t, store.Save(t.Context(), agg, 1, &accountRenamed{AccountID: "acct-1", Name: "Fresh"}))
+
+	got, err := event.Collect(t.Context(), store, &createdOnlyAccount{ID: "acct-1"}, event.ReadOptions{})
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, "created", got[0].Event.EventName())
+	require.Equal(t, uint64(1), got[0].Version)
+}
+
 func TestEventStoreStreamSkipsSnapshotsByDefault(t *testing.T) {
 	env := natstest.Run(t)
 	env.CreateEventStream(t, "test", "account")
@@ -817,6 +838,21 @@ func TestEventStoreStreamPropagatesDecodeError(t *testing.T) {
 	}
 	require.Equal(t, 1, count)
 	require.Error(t, gotErr)
+}
+
+func TestEventStoreLoadPropagatesKnownDecodeError(t *testing.T) {
+	env := natstest.Run(t)
+	env.CreateEventStream(t, "test", "account")
+
+	store, err := goeventnats.NewEventStore(env.Conn, goeventnats.EventStoreConfig{})
+	require.NoError(t, err)
+
+	_, err = env.JetStream.Publish(t.Context(), "test.event.account.acct-1.created", []byte("{not-json"))
+	require.NoError(t, err)
+
+	_, err = store.Load(t.Context(), &account{ID: "acct-1"})
+	require.Error(t, err)
+	require.ErrorContains(t, err, "decode event test.event.account.acct-1.created")
 }
 
 func TestEventStoreCollectAndFindFirst(t *testing.T) {
