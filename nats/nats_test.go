@@ -738,6 +738,87 @@ func TestNATSBusScopedQueueConsumerUsesLongFormCreatePermission(t *testing.T) {
 	require.Equal(t, "renamed", receive(t, seen))
 }
 
+func TestEventStoreConsumerNameSupportsScopedAggregateReads(t *testing.T) {
+	const (
+		consumerName = "aggregate_reader"
+		streamName   = "TEST_ACCOUNT_EVENTS"
+	)
+	allPerms := &server.Permissions{
+		Publish:   &server.SubjectPermission{Allow: []string{">"}},
+		Subscribe: &server.SubjectPermission{Allow: []string{">"}},
+	}
+	scopedPerms := &server.Permissions{
+		Publish: &server.SubjectPermission{Allow: []string{
+			"test.event.account.acct-1.>",
+			"$JS.API.STREAM.INFO." + streamName,
+			"$JS.API.DIRECT.GET." + streamName + ".test.event.account.acct-1.snapshot",
+			"$JS.API.CONSUMER.CREATE." + streamName + "." + consumerName + ".test.event.account.acct-1.>",
+			"$JS.API.CONSUMER.DELETE." + streamName + "." + consumerName,
+			"$JS.API.CONSUMER.MSG.NEXT." + streamName + "." + consumerName,
+		}},
+		Subscribe: &server.SubjectPermission{Allow: []string{"_INBOX.>"}},
+	}
+	env := natstest.Run(t, natstest.WithServerOptions(func(opts *server.Options) {
+		opts.NoAuthUser = "admin"
+		opts.Users = []*server.User{
+			{Username: "admin", Password: "admin", Permissions: allPerms},
+			{Username: "scoped", Password: "scoped", Permissions: scopedPerms},
+		}
+	}))
+	env.CreateEventStream(t, "test", "account")
+
+	scopedConn, err := gonats.Connect(env.URL, gonats.UserInfo("scoped", "scoped"))
+	require.NoError(t, err)
+	t.Cleanup(scopedConn.Close)
+
+	cfg := goeventnats.EventStoreConfig{
+		SnapshotEvery: 1,
+		ConsumerName: func(event.AggregateRef) string {
+			return consumerName
+		},
+	}
+	snapshotStore, err := goeventnats.NewEventStore(scopedConn, cfg)
+	require.NoError(t, err)
+	plainStore, err := goeventnats.NewEventStore(scopedConn, goeventnats.EventStoreConfig{
+		ConsumerName: cfg.ConsumerName,
+	})
+	require.NoError(t, err)
+
+	agg := &snapshottedAccount{ID: "acct-1"}
+	require.NoError(t, snapshotStore.Save(t.Context(), agg, 0, &accountCreated{AccountID: "acct-1", Name: "Acme"}))
+
+	stream, err := env.JetStream.Stream(t.Context(), streamName)
+	require.NoError(t, err)
+	snap, err := stream.GetLastMsgForSubject(t.Context(), "test.event.account.acct-1.snapshot")
+	require.NoError(t, err)
+	require.NoError(t, plainStore.Save(t.Context(), agg, snap.Sequence, &accountRenamed{AccountID: "acct-1", Name: "Fresh"}))
+
+	loaded := &snapshottedAccount{ID: "acct-1"}
+	version, err := snapshotStore.Load(t.Context(), loaded)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), version)
+	require.Equal(t, "Fresh", loaded.Name)
+
+	var typed []event.StoredEvent
+	for rec, err := range snapshotStore.Stream(t.Context(), &snapshottedAccount{ID: "acct-1"}, event.ReadOptions{}) {
+		require.NoError(t, err)
+		typed = append(typed, rec)
+	}
+	require.Len(t, typed, 1)
+	require.Equal(t, "renamed", typed[0].Event.EventName())
+
+	ref := event.AggregateKey{Scope: "test", Type: "account", ID: "acct-1"}
+	var generic []event.StoredEvent
+	for rec, err := range plainStore.Stream(t.Context(), ref, event.ReadOptions{}) {
+		require.NoError(t, err)
+		generic = append(generic, rec)
+	}
+	require.Len(t, generic, 3)
+	require.Equal(t, "created", generic[0].Event.EventName())
+	require.Equal(t, event.DefaultSnapshotEventName, generic[1].Event.EventName())
+	require.Equal(t, "renamed", generic[2].Event.EventName())
+}
+
 func TestNATSBusQueueHandlerSupportsCustomEventKind(t *testing.T) {
 	env := natstest.Run(t)
 	env.CreateMessageStream(t, "test", "log", "worker")

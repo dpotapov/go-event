@@ -350,8 +350,22 @@ rec, ok, err := event.FindFirst(ctx, store, agg, event.ReadOptions{}, func(evt e
 })
 ```
 
-The read path uses an ephemeral JetStream ordered consumer filtered to one
-aggregate. It does not create durable load consumers.
+By default, the read path uses an ephemeral JetStream ordered consumer filtered
+to one aggregate. When running with scoped NATS permissions, configure
+`EventStoreConfig.ConsumerName` to return a deterministic consumer name for the
+aggregate:
+
+```go
+store, err := natsevt.NewEventStore(nc, natsevt.EventStoreConfig{
+	ConsumerName: func(ref event.AggregateRef) string {
+		return "orders_" + ref.AggregateID()
+	},
+})
+```
+
+The same consumer name is used for `Load`, snapshot counting during `Save`, and
+`Stream`. Calls for the same aggregate/name should be sequential because the
+store deletes any stale named consumer before use and deletes it again after use.
 
 ## Stream Creation
 

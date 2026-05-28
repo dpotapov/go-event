@@ -15,6 +15,7 @@ import (
 const aggregateConsumerInactiveThreshold = 5 * time.Second
 
 type aggregateReadContext struct {
+	streamName     string
 	stream         jetstream.Stream
 	filter         string
 	registry       event.DecoderRegistry
@@ -39,6 +40,7 @@ func (s *EventStore) resolveReadContext(ctx context.Context, agg event.ESAggrega
 	snapshotSuffix := "." + snapshotEventName(snapshotType)
 	_, snapshottable := agg.(event.Snapshottable)
 	return aggregateReadContext{
+		streamName:     streamName,
 		stream:         stream,
 		filter:         AggregateMessageFilter(agg.AggregateScope(), agg.AggregateType(), agg.AggregateID()),
 		registry:       registry,
@@ -57,8 +59,9 @@ func (s *EventStore) resolveGenericReadContext(ctx context.Context, ref event.Ag
 		return aggregateReadContext{}, fmt.Errorf("get stream %s: %w", streamName, err)
 	}
 	return aggregateReadContext{
-		stream: stream,
-		filter: AggregateMessageFilter(ref.AggregateScope(), ref.AggregateType(), ref.AggregateID()),
+		streamName: streamName,
+		stream:     stream,
+		filter:     AggregateMessageFilter(ref.AggregateScope(), ref.AggregateType(), ref.AggregateID()),
 	}, nil
 }
 
@@ -93,18 +96,81 @@ func startSeqAfterSnapshot(
 	return msg.Sequence + 1, raw, nil
 }
 
-func openAggregateConsumer(ctx context.Context, stream jetstream.Stream, filter string, startSeq uint64) (jetstream.Consumer, error) {
+func (s *EventStore) openAggregateConsumer(
+	ctx context.Context,
+	read aggregateReadContext,
+	ref event.AggregateRef,
+	startSeq uint64,
+) (jetstream.Consumer, func(), error) {
+	if s.consumerName != nil {
+		if consumerName := s.consumerName(ref); consumerName != "" {
+			consumer, err := s.openNamedAggregateConsumer(ctx, read, consumerName, startSeq)
+			if err != nil {
+				return nil, nil, err
+			}
+			cleanup := func() {
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer cancel()
+				if derr := s.deleteNamedConsumer(cleanupCtx, read.streamName, consumerName); derr != nil && !errors.Is(derr, jetstream.ErrStreamNotFound) {
+					s.logger.WarnContext(ctx, "Failed to delete named aggregate consumer",
+						"stream", read.streamName,
+						"consumer", consumerName,
+						"err", derr,
+					)
+				}
+			}
+			return consumer, cleanup, nil
+		}
+	}
 	if startSeq == 0 {
 		startSeq = 1
 	}
-	consumer, err := stream.OrderedConsumer(ctx, jetstream.OrderedConsumerConfig{
-		FilterSubjects:    []string{filter},
+	consumer, err := read.stream.OrderedConsumer(ctx, jetstream.OrderedConsumerConfig{
+		FilterSubjects:    []string{read.filter},
 		DeliverPolicy:     jetstream.DeliverByStartSequencePolicy,
 		OptStartSeq:       startSeq,
 		InactiveThreshold: aggregateConsumerInactiveThreshold,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create aggregate consumer: %w", err)
+		return nil, nil, fmt.Errorf("create aggregate consumer: %w", err)
+	}
+	return consumer, func() {}, nil
+}
+
+func (s *EventStore) openNamedAggregateConsumer(
+	ctx context.Context,
+	read aggregateReadContext,
+	consumerName string,
+	startSeq uint64,
+) (jetstream.Consumer, error) {
+	if err := s.deleteNamedConsumer(ctx, read.streamName, consumerName); err != nil {
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			return nil, errStreamNotFound
+		}
+		return nil, fmt.Errorf("delete stale named consumer %q: %w", consumerName, err)
+	}
+
+	consumerCfg := jetstream.ConsumerConfig{
+		Name:              consumerName,
+		Durable:           consumerName,
+		FilterSubject:     read.filter,
+		AckPolicy:         jetstream.AckNonePolicy,
+		ReplayPolicy:      jetstream.ReplayInstantPolicy,
+		InactiveThreshold: aggregateConsumerInactiveThreshold,
+	}
+	if startSeq > 0 {
+		consumerCfg.DeliverPolicy = jetstream.DeliverByStartSequencePolicy
+		consumerCfg.OptStartSeq = startSeq
+	} else {
+		consumerCfg.DeliverPolicy = jetstream.DeliverAllPolicy
+	}
+
+	consumer, err := read.stream.CreateOrUpdateConsumer(ctx, consumerCfg)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			return nil, errStreamNotFound
+		}
+		return nil, fmt.Errorf("create named consumer %q: %w", consumerName, err)
 	}
 	return consumer, nil
 }
@@ -266,11 +332,12 @@ func (s *EventStore) streamTyped(ctx context.Context, agg event.ESAggregate, opt
 		}
 	}
 
-	consumer, err := openAggregateConsumer(ctx, read.stream, read.filter, startSeq)
+	consumer, cleanup, err := s.openAggregateConsumer(ctx, read, agg, startSeq)
 	if err != nil {
 		yield(event.StoredEvent{}, err)
 		return
 	}
+	defer cleanup()
 
 	_, err = s.forEachAggregateMessage(ctx, consumer, func(subject string, data []byte, timestamp time.Time, version uint64) error {
 		rec, ok, err := s.storedEventFromMessage(
@@ -312,11 +379,12 @@ func (s *EventStore) streamGeneric(ctx context.Context, ref event.AggregateRef, 
 		return
 	}
 
-	consumer, err := openAggregateConsumer(ctx, read.stream, read.filter, 1)
+	consumer, cleanup, err := s.openAggregateConsumer(ctx, read, ref, 1)
 	if err != nil {
 		yield(event.StoredEvent{}, err)
 		return
 	}
+	defer cleanup()
 
 	_, err = s.forEachAggregateMessage(ctx, consumer, func(subject string, data []byte, timestamp time.Time, version uint64) error {
 		rec, err := genericStoredEventFromMessage(subject, data, timestamp, version)
