@@ -384,8 +384,9 @@ stream, err := js.CreateOrUpdateStream(ctx, cfg)
 ```
 
 Handlers are registered before `Connect`. Ordered event handlers are grouped by
-aggregate type behind a broad ordered subscription and catch up before command and
-queue handlers start; queue handlers use precise durable consumers.
+aggregate type behind handler-derived ordered subscription filters and catch up
+before command and queue handlers start; queue handlers use precise durable
+consumers.
 
 ## Queue Consumer Strategy
 

@@ -496,6 +496,35 @@ func TestBusQueueHandlersShareSubscriptionWithEventNameFilters(t *testing.T) {
 	require.Equal(t, "svc", cfg.ConsumerName)
 }
 
+func TestBusOrderedHandlersBuildMinimalStreamFilters(t *testing.T) {
+	events := &recordingEventSubscriber{}
+	bus := NewBus(nil, nil, nil, events, BusOptions{})
+
+	HandleEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+		return nil
+	})
+	HandleEvent(bus, func(ctx context.Context, evt *accountRenamed) error {
+		return nil
+	})
+
+	require.NoError(t, bus.Connect(t.Context()))
+	t.Cleanup(func() { require.NoError(t, bus.Disconnect()) })
+
+	require.Len(t, events.subs, 1)
+	cfg := events.subs[0]
+	require.Equal(t, "billing", cfg.AggregateScope)
+	require.Equal(t, []string{"account"}, cfg.AggregateTypes)
+	require.Empty(t, cfg.Kind)
+	require.Empty(t, cfg.AggregateIDs)
+	require.Empty(t, cfg.EventNames)
+	require.ElementsMatch(t, []EventSubscriptionFilter{
+		{Kind: KindEvent, EventNames: []string{"created"}},
+		{Kind: KindEvent, EventNames: []string{"renamed"}},
+	}, cfg.EventFilters)
+	require.Empty(t, cfg.Queue)
+	require.Empty(t, cfg.ConsumerName)
+}
+
 func TestBusQueueHandlersPassQueueMaxRetries(t *testing.T) {
 	events := &recordingEventSubscriber{}
 	bus := NewBus(nil, nil, nil, events, BusOptions{Queue: "svc", QueueMaxRetries: 10})

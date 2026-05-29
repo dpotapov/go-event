@@ -668,6 +668,39 @@ func TestQueueSubscriptionCreatesConsumerWithPreciseFilters(t *testing.T) {
 	require.ElementsMatch(t, []string{"test.event.account.*.created", "test.event.account.*.renamed"}, cfg.FilterSubjects)
 }
 
+func TestNATSBusOrderedHandlersCreateConsumerWithPreciseFilters(t *testing.T) {
+	env := natstest.Run(t)
+	stream := env.CreateEventStream(t, "test", "account")
+	info, err := stream.Info(t.Context())
+	require.NoError(t, err)
+
+	eventSub, err := goeventnats.NewSubscriber(env.Conn, goeventnats.SubscriberConfig{})
+	require.NoError(t, err)
+	bus := event.NewBus(nil, nil, nil, eventSub, event.BusOptions{})
+
+	event.HandleEvent(bus, func(ctx context.Context, evt *accountCreated) error {
+		return nil
+	})
+	event.HandleEvent(bus, func(ctx context.Context, evt *accountRenamed) error {
+		return nil
+	})
+
+	require.NoError(t, bus.Connect(t.Context()))
+	t.Cleanup(func() { require.NoError(t, bus.Disconnect()) })
+
+	var names []string
+	require.Eventually(t, func() bool {
+		names = env.ConsumerNames(t, info.Config.Name)
+		return len(names) == 1
+	}, 5*time.Second, 50*time.Millisecond)
+
+	consumer, err := env.JetStream.Consumer(t.Context(), info.Config.Name, names[0])
+	require.NoError(t, err)
+	cfg := consumer.CachedInfo().Config
+	require.Empty(t, cfg.FilterSubject)
+	require.ElementsMatch(t, []string{"test.event.account.*.created", "test.event.account.*.renamed"}, cfg.FilterSubjects)
+}
+
 func TestNATSBusScopedQueueConsumerUsesLongFormCreatePermission(t *testing.T) {
 	const (
 		queue      = "svc"

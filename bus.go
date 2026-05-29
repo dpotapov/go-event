@@ -441,10 +441,11 @@ func (b *Bus) startOrderedGroup(ctx context.Context, group *eventGroup, caughtUp
 			return b.cursorStore.SaveCursor(ctx, stream, cursor)
 		})
 	}
+	eventFilters := groupEventFilters(group)
 	sub, err := b.events.SubscribeEvents(ctx, handler, EventSubscriptionConfig{
 		AggregateScope:   group.scope,
-		Kind:             group.kind,
 		AggregateTypes:   []string{group.agg},
+		EventFilters:     eventFilters,
 		Cursor:           cursor,
 		CursorBootPolicy: b.cursorBootPolicy,
 		CaughtUp: func() {
